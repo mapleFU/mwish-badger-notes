@@ -43,24 +43,32 @@ import (
 // Each option X is documented on the WithX method.
 type Options struct {
 	// Required options.
+	// 在默认配置中，Dir 和 ValueDir 在同一个目录下.
 
 	Dir      string
 	ValueDir string
 
 	// Usually modified options.
 
+	// 写入是否是 sync 的, 应该是约束了 fsync.
 	SyncWrites        bool
+	// 需要保持的版本数目.
+	// TODO(mwish): 似乎 badger 有 MVCC, 但我们不知道这个逻辑具体是给谁/做什么的.
 	NumVersionsToKeep int
 	ReadOnly          bool
 	Logger            Logger
+	// zstd/snappy/不压缩
 	Compression       options.CompressionType
 	InMemory          bool
+	// 收集 metrics 信息
+	// TODO(mwish): 这里 metrics 是打给谁的呢.
 	MetricsEnabled    bool
 	// Sets the Stream.numGo field
 	NumGoroutines int
 
 	// Fine tuning options.
 
+	// MemTable 的大小, 似乎单位是 mb?
 	MemTableSize        int64
 	BaseTableSize       int64
 	BaseLevelSize       int64
@@ -75,7 +83,9 @@ type Options struct {
 	// read from the block index stored at the end of the table.
 	BlockSize          int
 	BloomFalsePositive float64
+	// BlockCache 是 Block 的缓存
 	BlockCacheSize     int64
+	// IndexCache 比 BlockCache 轻量，属于 Index 的缓存.
 	IndexCacheSize     int64
 
 	NumLevelZeroTables      int
@@ -83,7 +93,7 @@ type Options struct {
 
 	ValueLogFileSize   int64
 	ValueLogMaxEntries uint32
-
+	// TODO(mwish): 这是什么玩意...
 	NumCompactors        int
 	CompactL0OnClose     bool
 	LmaxCompaction       bool
@@ -99,11 +109,15 @@ type Options struct {
 	// BypassLockGuard will bypass the lock guard on badger. Bypassing lock
 	// guard can cause data corruption if multiple badger instances are using
 	// the same directory. Use this options with caution.
+	//
+	// TODO(mwish): ????
+	// https://github.com/dgraph-io/badger/pull/1243 这个似乎是 flock 出问题的时候的代码.
 	BypassLockGuard bool
 
 	// ChecksumVerificationMode decides when db should verify checksums for SSTable blocks.
 	ChecksumVerificationMode options.ChecksumVerificationMode
 
+	// #1698 引入.
 	// AllowStopTheWorld determines whether the DropPrefix will be blocking/non-blocking.
 	AllowStopTheWorld bool
 

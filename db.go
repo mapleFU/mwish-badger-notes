@@ -189,6 +189,7 @@ func Open(opt Options) (*DB, error) {
 	if err := checkAndSetOptions(&opt); err != nil {
 		return nil, err
 	}
+	// 需要的文件锁.
 	var dirLockGuard, valueDirLockGuard *directoryLockGuard
 
 	// Create directories and acquire lock on it only if badger is not running in InMemory mode.
@@ -231,6 +232,7 @@ func Open(opt Options) (*DB, error) {
 		}
 	}
 
+	// 拿到 manifest 文件.
 	manifestFile, manifest, err := openOrCreateManifestFile(opt)
 	if err != nil {
 		return nil, err
