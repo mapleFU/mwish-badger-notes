@@ -52,6 +52,8 @@ type oracle struct {
 
 	// committedTxns contains all committed writes (contains fingerprints
 	// of keys written and their latest commit counter).
+	//
+	// 缓存了 committed 的写, 随着读提高而释放部分.
 	committedTxns []committedTxn
 	lastCleanupTs uint64
 
@@ -103,6 +105,8 @@ func (o *oracle) readTs() uint64 {
 	// timestamp and are going through the write to value log and LSM tree
 	// process. Not waiting here could mean that some txns which have been
 	// committed would not be read.
+	//
+	// 等待 txnMark 上的写事务全都完成.
 	y.Check(o.txnMark.WaitForMark(context.Background(), readTs))
 	return readTs
 }
@@ -163,16 +167,19 @@ func (o *oracle) hasConflict(txn *Txn) bool {
 	return false
 }
 
+// return (commitTs, hasConflict).
 func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
 	o.Lock()
 	defer o.Unlock()
 
+	// 如果有 conflictTxn, 那么无法返回正确的, 有冲突.
 	if o.hasConflict(txn) {
 		return 0, true
 	}
 
 	var ts uint64
 	if !o.isManaged {
+		// TODO(mwish): 为什么要在这里 DoneRead?
 		o.doneRead(txn)
 		o.cleanupCommittedTransactions()
 
@@ -214,6 +221,7 @@ func (o *oracle) cleanupCommittedTransactions() { // Must be called under o.Lock
 		return
 	}
 	// Same logic as discardAtOrBelow but unlocked
+	// 获取读的高水位.
 	var maxReadTs uint64
 	if o.isManaged {
 		maxReadTs = o.discardTs
@@ -230,6 +238,7 @@ func (o *oracle) cleanupCommittedTransactions() { // Must be called under o.Lock
 	}
 	o.lastCleanupTs = maxReadTs
 
+	// 根据推高的读释放掉, 来判断读写冲突.
 	tmp := o.committedTxns[:0]
 	for _, txn := range o.committedTxns {
 		if txn.ts <= maxReadTs {
@@ -245,6 +254,7 @@ func (o *oracle) doneCommit(cts uint64) {
 		// No need to update anything.
 		return
 	}
+	// txnMark 推高
 	o.txnMark.Done(cts)
 }
 
@@ -259,6 +269,7 @@ type Txn struct {
 	db       *DB
 
 	// 这里的读取不采用 key set, 采用 fingerprint, 这里不会误判, 但是可能有 false positive.
+	// 这个是为写事务准备的 read set.
 	reads []uint64 // contains fingerprints of keys read.
 	// contains fingerprints of keys written. This is used for conflict detection.
 	conflictKeys map[uint64]struct{}
@@ -422,6 +433,8 @@ func (txn *Txn) modify(e *Entry) error {
 		fp := z.MemHash(e.Key) // Avoid dealing with byte arrays.
 		txn.conflictKeys[fp] = struct{}{}
 	}
+	// TODO(mwish): 不懂 manage mode 了. 感觉大概意思是, 外部处理 txn-ts 的时候的逻辑?
+	//
 	// If a duplicate entry was inserted in managed mode, move it to the duplicate writes slice.
 	// Add the entry to duplicateWrites only if both the entries have different versions. For
 	// same versions, we will overwrite the existing entry.
@@ -468,6 +481,8 @@ func (txn *Txn) Delete(key []byte) error {
 
 // Get looks for key and returns corresponding Item.
 // If key is not found, ErrKeyNotFound is returned.
+//
+// 先走 update set 查, 没有再走 `txn.db.get`. 如果是更新事务, 要记录下内容.
 func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	if len(key) == 0 {
 		return nil, ErrEmptyKey
@@ -570,6 +585,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	}
 
 	keepTogether := true
+	// 如果没有外部版本，全部设置成 commitTs.
 	setVersion := func(e *Entry) {
 		if e.version == 0 {
 			e.version = commitTs
@@ -591,6 +607,8 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	processEntry := func(e *Entry) {
 		// Suffix the keys with commit ts, so the key versions are sorted in
 		// descending order of commit timestamp.
+		//
+		// 把 ts 编码到 key 上.
 		e.Key = y.KeyWithTs(e.Key, e.version)
 		// Add bitTxn only if these entries are part of a transaction. We
 		// support SetEntryAt(..) in managed mode which means a single
@@ -644,6 +662,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 }
 
 func (txn *Txn) commitPrecheck() error {
+	// 已经被 discard (abort) 了.
 	if txn.discarded {
 		return errors.New("Trying to commit a discarded txn")
 	}
@@ -654,6 +673,8 @@ func (txn *Txn) commitPrecheck() error {
 		}
 	}
 
+	// TODO(mwish): managedTxns 是什么 jb 逻辑啊...
+	//
 	// If keepTogether is True, it implies transaction markers will be added.
 	// In that case, commitTs should not be never be zero. This might happen if
 	// someone uses txn.Commit instead of txn.CommitAt in managed mode.  This
@@ -668,12 +689,16 @@ func (txn *Txn) commitPrecheck() error {
 // Commit commits the transaction, following these steps:
 //
 // 1. If there are no writes, return immediately.
+// (没有写入, 只有读的话, readTs 会推迟到所有写事务完成, 所以没问题).
 //
 // 2. Check if read rows were updated since txn started. If so, return ErrConflict.
+// (readTs -> nextTxnTs - 1] 期间, rowset 没有被修改, 可能会有 false positive).
 //
 // 3. If no conflict, generate a commit timestamp and update written rows' commit ts.
+// (生成 nextTs).
 //
 // 4. Batch up all writes, write them to value log and LSM tree.
+// (写入 LSM-Tree).
 //
 // 5. If callback is provided, Badger will return immediately after checking
 // for conflicts. Writes to the database will happen in the background.  If

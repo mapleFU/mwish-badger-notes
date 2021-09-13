@@ -38,8 +38,8 @@ func (u *uint64Heap) Pop() interface{} {
 	return x
 }
 
-// mark 相当于一个 tagged union, 产生可以看 `Begin`, `BeginMany`, `Done`, `DoneMany` 结构.
-// done
+// mark 相当于一个 tagged union, 产生可以看 `Begin`, `BeginMany`, `Done`, `DoneMany` 结构和 `WaitForMark` 结构.
+// done 表示是否完成. 即 Either this is an (index, waiter) pair or (index, done) or (indices, done).
 //
 // mark contains one of more indices, along with a done boolean to indicate the
 // status of the index: begin or done. It also contains waiters, who could be
@@ -117,6 +117,8 @@ func (w *WaterMark) LastIndex() uint64 {
 }
 
 // WaitForMark waits until the given index is marked as done.
+//
+// waitForMark 是说, 等待相关的全都 Done
 func (w *WaterMark) WaitForMark(ctx context.Context, index uint64) error {
 	// 已经到达 mark
 	if w.DoneUntil() >= index {
@@ -151,10 +153,13 @@ func (w *WaterMark) process(closer *z.Closer) {
 
 	heap.Init(&indices)
 
+	// processOn 仅处理一个 done
 	processOne := func(index uint64, done bool) {
 		// If not already done, then set. Otherwise, don't undo a done entry.
 
-		// 相当于给 default map 做变更
+		// 相当于给 default map 做变更: (pending, indexes 堆) 是一个 pair, 在一个里面有, 两个一定都有
+		// 1. 如果 index 不存在, 那么需要给 heap 里面加上
+		// 2. prev 在 pending 不存在的时候为0, 然后, delta 如果是 done 就 -1, 否则 +1.
 		prev, present := pending[index]
 		if !present {
 			heap.Push(&indices, index)
@@ -168,6 +173,8 @@ func (w *WaterMark) process(closer *z.Closer) {
 
 		// Update mark by going through all indices in order; and checking if they have
 		// been done. Stop at the first index, which isn't done.
+		//
+		// 拿到 done 的低水位.
 		doneUntil := w.DoneUntil()
 		if doneUntil > index {
 			AssertTruef(false, "Name: %s doneUntil: %d. Index: %d", w.Name, doneUntil, index)
@@ -176,6 +183,7 @@ func (w *WaterMark) process(closer *z.Closer) {
 		until := doneUntil
 		loops := 0
 
+		// 当 heap 还有元素, 且 pending 还有对象的时候, 变更水位.
 		for len(indices) > 0 {
 			min := indices[0]
 			if done := pending[min]; done > 0 {
@@ -189,6 +197,7 @@ func (w *WaterMark) process(closer *z.Closer) {
 			loops++
 		}
 
+		// until != doneUntil 的时候, 推高低水位.
 		if until != doneUntil {
 			AssertTrue(atomic.CompareAndSwapUint64(&w.doneUntil, doneUntil, until))
 		}
@@ -226,8 +235,10 @@ func (w *WaterMark) process(closer *z.Closer) {
 			if mark.waiter != nil {
 				doneUntil := atomic.LoadUint64(&w.doneUntil)
 				if doneUntil >= mark.index {
+					// 小于低水位的, 会被拒绝
 					close(mark.waiter)
 				} else {
+					// 否则, waiters[index] 注册这个信息.
 					// 添加到 waiters 列表中.
 					ws, ok := waiters[mark.index]
 					if !ok {
