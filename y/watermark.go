@@ -38,6 +38,9 @@ func (u *uint64Heap) Pop() interface{} {
 	return x
 }
 
+// mark 相当于一个 tagged union, 产生可以看 `Begin`, `BeginMany`, `Done`, `DoneMany` 结构.
+// done
+//
 // mark contains one of more indices, along with a done boolean to indicate the
 // status of the index: begin or done. It also contains waiters, who could be
 // waiting for the watermark to reach >= a certain index.
@@ -60,7 +63,9 @@ type mark struct {
 // Since doneUntil and lastIndex addresses are passed to sync/atomic packages, we ensure that they
 // are 64-bit aligned by putting them at the beginning of the structure.
 type WaterMark struct {
+	// 实际上是一个 low watermark.
 	doneUntil uint64
+	// TODO(mwish): 实际上是一个类似 high watermark 的东西?
 	lastIndex uint64
 	Name      string
 	markCh    chan mark
@@ -113,6 +118,7 @@ func (w *WaterMark) LastIndex() uint64 {
 
 // WaitForMark waits until the given index is marked as done.
 func (w *WaterMark) WaitForMark(ctx context.Context, index uint64) error {
+	// 已经到达 mark
 	if w.DoneUntil() >= index {
 		return nil
 	}
@@ -147,6 +153,8 @@ func (w *WaterMark) process(closer *z.Closer) {
 
 	processOne := func(index uint64, done bool) {
 		// If not already done, then set. Otherwise, don't undo a done entry.
+
+		// 相当于给 default map 做变更
 		prev, present := pending[index]
 		if !present {
 			heap.Push(&indices, index)
@@ -220,6 +228,7 @@ func (w *WaterMark) process(closer *z.Closer) {
 				if doneUntil >= mark.index {
 					close(mark.waiter)
 				} else {
+					// 添加到 waiters 列表中.
 					ws, ok := waiters[mark.index]
 					if !ok {
 						waiters[mark.index] = []chan struct{}{mark.waiter}

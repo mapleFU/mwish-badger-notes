@@ -47,6 +47,7 @@ type oracle struct {
 	// Either of these is used to determine which versions can be permanently
 	// discarded during compaction.
 	discardTs uint64       // Used by ManagedDB.
+	// 相当于读的水位
 	readMark  *y.WaterMark // Used by DB.
 
 	// committedTxns contains all committed writes (contains fingerprints
@@ -92,7 +93,9 @@ func (o *oracle) readTs() uint64 {
 
 	var readTs uint64
 	o.Lock()
+	// readTs 获取目前最大的可用 TS.
 	readTs = o.nextTxnTs - 1
+	// 添加一个读相关的水位.
 	o.readMark.Begin(readTs)
 	o.Unlock()
 
@@ -249,10 +252,13 @@ func (o *oracle) doneCommit(cts uint64) {
 type Txn struct {
 	readTs   uint64
 	commitTs uint64
+	//
 	size     int64
 	count    int64
+	// 绑定的 db 对象, 读的起源.
 	db       *DB
 
+	// 这里的读取不采用 key set, 采用 fingerprint, 这里不会误判, 但是可能有 false positive.
 	reads []uint64 // contains fingerprints of keys read.
 	// contains fingerprints of keys written. This is used for conflict detection.
 	conflictKeys map[uint64]struct{}
@@ -264,6 +270,7 @@ type Txn struct {
 	numIterators int32
 	discarded    bool
 	doneRead     bool
+	// 是否是更新的事务.
 	update       bool // update is used to conditionally keep track of reads.
 }
 
