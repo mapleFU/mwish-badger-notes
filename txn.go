@@ -143,6 +143,8 @@ func (o *oracle) discardAtOrBelow() uint64 {
 
 // hasConflict must be called while having a lock.
 func (o *oracle) hasConflict(txn *Txn) bool {
+	// 如果一个读写事务什么都没读, 那么肯定没有 conflict.
+	// 这里在 `txn.addReadKey` 的时候会添加. 纯 Set 的事务反而不会添加这个?
 	if len(txn.reads) == 0 {
 		return false
 	}
@@ -157,6 +159,7 @@ func (o *oracle) hasConflict(txn *Txn) bool {
 			continue
 		}
 
+		// 检查 conflict set, 看和 committedTxn 的 keys 是否有 conflict.
 		for _, ro := range txn.reads {
 			if _, has := committedTxn.conflictKeys[ro]; has {
 				return true
@@ -195,6 +198,7 @@ func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
 
 	y.AssertTrue(ts >= o.lastCleanupTs)
 
+	// 添加到 committedTxns 的集合中, 这个需要保证在 `newCommitTs` 中通过检查.
 	if o.detectConflicts {
 		// We should ensure that txns are not added to o.committedTxns slice when
 		// conflict detection is disabled otherwise this slice would keep growing.
@@ -254,7 +258,7 @@ func (o *oracle) doneCommit(cts uint64) {
 		// No need to update anything.
 		return
 	}
-	// txnMark 推高
+	// txnMark 推高水位, txnMark 里面只能有一个 txn.
 	o.txnMark.Done(cts)
 }
 
@@ -586,6 +590,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 
 	keepTogether := true
 	// 如果没有外部版本，全部设置成 commitTs.
+	// 如果外部带了 version, 属于是外部维护的.
 	setVersion := func(e *Entry) {
 		if e.version == 0 {
 			e.version = commitTs
@@ -596,6 +601,8 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	for _, e := range txn.pendingWrites {
 		setVersion(e)
 	}
+	// Note: 只有 managed mode 模式下会有 duplicateWrites.
+	//
 	// The duplicateWrites slice will be non-empty only if there are duplicate
 	// entries with different versions.
 	for _, e := range txn.duplicateWrites {
@@ -615,6 +622,8 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		// transaction can have entries with different timestamps. If entries
 		// in a single transaction have different timestamps, we don't add the
 		// transaction markers.
+		//
+		// 如果非 manage mode, 这里会 mark as txn.
 		if keepTogether {
 			e.meta |= bitTxn
 		}
@@ -651,10 +660,13 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		return nil, err
 	}
 	ret := func() error {
+		// 等待 txn.
 		err := req.Wait()
 		// Wait before marking commitTs as done.
 		// We can't defer doneCommit above, because it is being called from a
 		// callback here.
+		//
+		// doneCommit
 		orc.doneCommit(commitTs)
 		return err
 	}
@@ -732,7 +744,9 @@ func (txn *Txn) Commit() error {
 }
 
 type txnCb struct {
+	// commit hook.
 	commit func() error
+	// 用户处理 error 的 hook.
 	user   func(error)
 	err    error
 }
