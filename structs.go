@@ -24,6 +24,7 @@ import (
 )
 
 type valuePointer struct {
+	// Fid 是文件 id.
 	Fid    uint32
 	Len    uint32
 	Offset uint32
@@ -137,6 +138,12 @@ func (h *header) DecodeFrom(reader *hashReader) (int, error) {
 
 // Entry provides Key, Value, UserMeta and ExpiresAt. This struct can be used by
 // the user to set data.
+//
+// Key, Value 和 TTL. meta 定义在 value.go 中, 比如删除的时候, 外部只会传入 key, meta 为
+// del.
+// 如果是 `Set` 的话, 就会 `NewEntry` (创建 key/value) -> `modify`(保证合法).
+//
+// 外部传进来的时候, 只有 Key, Value, ExpiresAt, UserMeta.
 type Entry struct {
 	Key       []byte
 	Value     []byte
@@ -155,6 +162,7 @@ func (e *Entry) isZero() bool {
 	return len(e.Key) == 0
 }
 
+// TODO(mwish): 这里阈值好像是 k-v 分离的阈值
 func (e *Entry) estimateSizeAndSetThreshold(threshold int64) int64 {
 	if e.valThreshold == 0 {
 		e.valThreshold = threshold

@@ -79,6 +79,9 @@ type safeRead struct {
 
 // hashReader implements io.Reader, io.ByteReader interfaces. It also keeps track of the number
 // bytes read. The hashReader writes to h (hash) what it reads from r.
+//
+// 有点牛逼, 这个包装了一层 reader, 然后读的时候往 crc 里面丢一份, 便于验证 crc, 这里相当于 overwrite 了 read
+// , 然后读到啥都给 crc hash 丢一份.
 type hashReader struct {
 	r         io.Reader
 	h         hash.Hash32
@@ -443,12 +446,13 @@ func (db *DB) valueThreshold() int64 {
 }
 
 type valueLog struct {
+	// vLog 的目录, 是可以配置的.
 	dirPath string
 
 	// guards our view of which files exist, which to be deleted, how many active iterators
 	filesLock        sync.RWMutex
-	filesMap         map[uint32]*logFile
-	maxFid           uint32
+	filesMap         map[uint32]*logFile // guard by filesLock
+	maxFid           uint32 // guard by filesLock
 	filesToBeDeleted []uint32
 	// A refcount of iterators -- when this hits zero, we can delete the filesToBeDeleted.
 	numActiveIterators int32
@@ -689,6 +693,7 @@ func (req *request) IncrRef() {
 	atomic.AddInt32(&req.ref, 1)
 }
 
+// 这里手动做了一个 ref deref, 保证只有一个线程在处理
 func (req *request) DecrRef() {
 	nRef := atomic.AddInt32(&req.ref, -1)
 	if nRef > 0 {
@@ -754,6 +759,12 @@ func (vlog *valueLog) woffset() uint32 {
 // validateWrites will check whether the given requests can fit into 4GB vlog file.
 // NOTE: 4GB is the maximum size we can create for vlog because value pointer offset is of type
 // uint32. If we create more than 4GB, it will overflow uint32. So, limiting the size to 4GB.
+//
+// 这里有两个阈限:
+// 1. maxVlogFileSize: vLog file 的大小不能超过 u32 的索引.
+// 2. 单个文件的 softlimit: vlog.opt.ValueLogFileSize.
+//
+// TODO(mwish): 这里应该是要求不超过, 不过来两个 2GB 多一点的, 不是绷不住了??? 能不能提一个 issue?
 func (vlog *valueLog) validateWrites(reqs []*request) error {
 	vlogOffset := uint64(vlog.woffset())
 	for _, req := range reqs {
@@ -786,6 +797,8 @@ func estimateRequestSize(req *request) uint64 {
 	return size
 }
 
+// valueLog.write 只会被 db 单线程写.
+//
 // write is thread-unsafe by design and should not be called concurrently.
 func (vlog *valueLog) write(reqs []*request) error {
 	if vlog.db.opt.InMemory || vlog.db.opt.managedTxns {
@@ -804,6 +817,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 	curlf := vlog.filesMap[maxFid]
 	vlog.filesLock.RUnlock()
 
+	// 处理 syncWrite.
 	defer func() {
 		if vlog.opt.SyncWrites {
 			if err := curlf.Sync(); err != nil {
@@ -812,6 +826,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		}
 	}()
 
+	// 写到 vLog 中
 	write := func(buf *bytes.Buffer) error {
 		if buf.Len() == 0 {
 			return nil
@@ -819,12 +834,15 @@ func (vlog *valueLog) write(reqs []*request) error {
 
 		n := uint32(buf.Len())
 		endOffset := atomic.AddUint32(&vlog.writableLogOffset, n)
+		// https://man7.org/linux/man-pages/man3/ftruncate.3p.html
+		// 厉害了.
 		// Increase the file size if we cannot accommodate this entry.
 		if int(endOffset) >= len(curlf.Data) {
 			curlf.Truncate(int64(endOffset))
 		}
 
 		start := int(endOffset - n)
+		// copy 到 mmap 管理的文件中
 		y.AssertTrue(copy(curlf.Data[start:], buf.Bytes()) == int(n))
 
 		atomic.StoreUint32(&curlf.size, endOffset)
@@ -848,8 +866,11 @@ func (vlog *valueLog) write(reqs []*request) error {
 	}
 
 	buf := new(bytes.Buffer)
+	// 对每个 requests (每个可能包含一个 txn).
 	for i := range reqs {
 		b := reqs[i]
+		// clear ptrs.
+		// ptr 指向对应的 Buf.
 		b.Ptrs = b.Ptrs[:0]
 		var written, bytesWritten int
 		valueSizes := make([]int64, 0, len(b.Entries))
@@ -857,7 +878,10 @@ func (vlog *valueLog) write(reqs []*request) error {
 			buf.Reset()
 
 			e := b.Entries[j]
+			// value append 到 buf 中.
 			valueSizes = append(valueSizes, int64(len(e.Value)))
+			// 如果数据是 inline 的 ( 小于 vlog.db.valueThreshold() )
+			// 就不写 vLog, 这里添加一个空的 valuePointer, Go 这个 ptr 是有默认值的=。=
 			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) {
 				b.Ptrs = append(b.Ptrs, valuePointer{})
 				continue
@@ -867,6 +891,8 @@ func (vlog *valueLog) write(reqs []*request) error {
 			p.Fid = curlf.fid
 			p.Offset = vlog.woffset()
 
+			// vLog 去掉 txn 相关的 mark.
+			//
 			// We should not store transaction marks in the vlog file because it will never have all
 			// the entries in a transaction. If we store entries with transaction marks then value
 			// GC will not be able to iterate on the entire vlog file.
@@ -874,6 +900,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 			// in a temporary variable and reassign it after writing to the value log.
 			tmpMeta := e.meta
 			e.meta = e.meta &^ (bitTxn | bitFinTxn)
+			// Note: 下面的函数介绍了如何编码 Entry
 			plen, err := curlf.encodeEntry(buf, e, p.Offset) // Now encode the entry into buffer.
 			if err != nil {
 				return err
@@ -883,6 +910,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 
 			p.Len = uint32(plen)
 			b.Ptrs = append(b.Ptrs, p)
+			// 调用 write 写 vLog 文件.
 			if err := write(buf); err != nil {
 				return err
 			}

@@ -385,6 +385,7 @@ func Open(opt Options) (*DB, error) {
 		return db, errors.Wrapf(err, "While setting banned keys")
 	}
 
+	// Closer 应该是可以 Wait Close 或者 Signal 的结构.
 	db.closers.writes = z.NewCloser(1)
 	go db.doWrites(db.closers.writes)
 
@@ -760,6 +761,7 @@ var requestPool = sync.Pool{
 }
 
 func (db *DB) writeToLSM(b *request) error {
+	// TODO(mwish): 这个 lock 保护了什么..?
 	db.lock.RLock()
 	defer db.lock.RUnlock()
 	for i, entry := range b.Entries {
@@ -791,6 +793,7 @@ func (db *DB) writeToLSM(b *request) error {
 			return y.Wrapf(err, "while writing to memTable")
 		}
 	}
+	// TODO(mwish): WAL 和 vLog 有什么区别? 为什么都在 mt 上?
 	if db.opt.SyncWrites {
 		return db.mt.SyncWAL()
 	}
@@ -810,6 +813,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 		}
 	}
 	db.opt.Debugf("writeRequests called. Writing to value log")
+	// 先写 vLog, 写的对象是 requests
 	err := db.vlog.write(reqs)
 	if err != nil {
 		done(err)
@@ -817,9 +821,11 @@ func (db *DB) writeRequests(reqs []*request) error {
 	}
 
 	db.opt.Debugf("Sending updates to subscribers")
+	// TODO(mwish): 这个地方似乎是做了一个订阅相关的广播?
 	db.pub.sendUpdates(reqs)
 	db.opt.Debugf("Writing to memtable")
 	var count int
+	// 串行写 memtable.
 	for _, b := range reqs {
 		if len(b.Entries) == 0 {
 			continue
@@ -841,6 +847,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 			done(err)
 			return y.Wrap(err, "writeRequests")
 		}
+		// 具体写入的接口
 		if err := db.writeToLSM(b); err != nil {
 			done(err)
 			return y.Wrap(err, "writeRequests")
@@ -866,21 +873,27 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 
 	// We can only service one request because we need each txn to be stored in a contigous section.
 	// Txns should not interleave among other txns or rewrites.
+	//
+	// 这里从池子里拿, req 是需要同步的. 这里也通过 wg 来同步.
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.Entries = entries
 	req.Wg.Add(1)
 	req.IncrRef()     // for db write
 	db.writeCh <- req // Handled in doWrites.
+
+	// 添加 metrics.
 	y.NumPutsAdd(db.opt.MetricsEnabled, int64(len(entries)))
 
 	return req, nil
 }
 
+// 专门用一个线程(goroutine)来处理 write
 func (db *DB) doWrites(lc *z.Closer) {
 	defer lc.Done()
 	pendingCh := make(chan struct{}, 1)
 
+	// 具体调用 writeReq 的地方.
 	writeRequests := func(reqs []*request) {
 		if err := db.writeRequests(reqs); err != nil {
 			db.opt.Errorf("writeRequests: %v", err)
@@ -896,6 +909,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 	for {
 		var r *request
 		select {
+		// writeCh 如果收到了 Closer 关闭的消息, 就灰溜溜关掉. TODO(mwish): Close 会给 writeCh 发吗, 看来...
 		case r = <-db.writeCh:
 		case <-lc.HasBeenClosed():
 			goto closedCase
@@ -910,6 +924,8 @@ func (db *DB) doWrites(lc *z.Closer) {
 				goto writeCase
 			}
 
+			// pendingCh 这个 channel 是为了查看这个写函数是否还在 pending 的, 这个流程是 async 的.
+			// 相当于一个占位符.
 			select {
 			// Either push to pending, or continue to pick from writeCh.
 			case r = <-db.writeCh:
@@ -936,6 +952,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 
 	writeCase:
 		go writeRequests(reqs)
+		// 为写创建空间.
 		reqs = make([]*request, 0, 10)
 		reqLen.Set(0)
 	}

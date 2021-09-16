@@ -45,8 +45,10 @@ import (
 // both to the WAL and the skiplist. On a crash, the WAL is replayed to bring the skiplist back to
 // its pre-crash form.
 type memTable struct {
+	// 这里有一份内存 skiplist.
 	// TODO: Give skiplist z.Calloc'd []byte.
 	sl         *skl.Skiplist
+	// 这里还是有一份 wal.
 	wal        *logFile
 	maxVersion uint64
 	opt        Options
@@ -289,6 +291,8 @@ func (lf *logFile) Truncate(end int64) error {
 	return lf.MmapFile.Truncate(end)
 }
 
+// 具体内容都会写到 Buf 中. 返回 length.
+//
 // encodeEntry will encode entry to the buf
 // layout of entry
 // +--------+-----+-------+-------+

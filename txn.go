@@ -403,6 +403,9 @@ func ValidEntry(db *DB, key, val []byte) error {
 	return nil
 }
 
+// 根据 txn 的 flag 来处理 `Entry`, 这里有两个部分:
+// 1. 根据 txn 的信息, 和 key, value 来检查 Entry 的 kv 是否合法.
+// 2.
 func (txn *Txn) modify(e *Entry) error {
 	switch {
 	case !txn.update:
@@ -646,6 +649,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	if keepTogether {
 		// CommitTs should not be zero if we're inserting transaction markers.
 		y.AssertTrue(commitTs != 0)
+		// 给事务设置一个边界.
 		e := &Entry{
 			Key:   y.KeyWithTs(txnKey, commitTs),
 			Value: []byte(strconv.FormatUint(commitTs, 10)),
@@ -653,14 +657,14 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 		}
 		entries = append(entries, e)
 	}
-
+	// 在非 managed mode 的情况下, 这个事务的一组 entries 都会 `sendToWriteCh`.
 	req, err := txn.db.sendToWriteCh(entries)
 	if err != nil {
 		orc.doneCommit(commitTs)
 		return nil, err
 	}
 	ret := func() error {
-		// 等待 txn.
+		// 等待 txn 完成, 这里调用了 `request.Wait`, 等待 write channel 完成
 		err := req.Wait()
 		// Wait before marking commitTs as done.
 		// We can't defer doneCommit above, because it is being called from a
