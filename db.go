@@ -109,6 +109,7 @@ type DB struct {
 
 	opt       Options
 	manifest  *manifestFile
+	// LSM 管理, 前台写入的时候不会走到这, 读的时候才会.
 	lc        *levelsController
 	vlog      valueLog
 	writeCh   chan *request
@@ -747,6 +748,7 @@ func (db *DB) get(key []byte) (y.ValueStruct, error) {
 		if vs.Version == version {
 			return vs, nil
 		}
+		// 这里可以推高对应的 VS
 		if maxVs.Version < vs.Version {
 			maxVs = vs
 		}
@@ -809,11 +811,13 @@ func (db *DB) writeRequests(reqs []*request) error {
 	done := func(err error) {
 		for _, r := range reqs {
 			r.Err = err
+			// 合着这就是个 channel?
 			r.Wg.Done()
 		}
 	}
 	db.opt.Debugf("writeRequests called. Writing to value log")
 	// 先写 vLog, 写的对象是 requests
+	// 然后比较有意思的是, vLog 写成功然后后续失败感觉也没啥关系.
 	err := db.vlog.write(reqs)
 	if err != nil {
 		done(err)
@@ -825,7 +829,9 @@ func (db *DB) writeRequests(reqs []*request) error {
 	db.pub.sendUpdates(reqs)
 	db.opt.Debugf("Writing to memtable")
 	var count int
-	// 串行写 memtable.
+	// 串行写 memtable:
+	// 1. 确保空间足够. 这里比较有意思的是, 没有 WriteStall 降速.
+	// 2. writeToLSM 来写具体内容.
 	for _, b := range reqs {
 		if len(b.Entries) == 0 {
 			continue
@@ -833,6 +839,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 		count += len(b.Entries)
 		var i uint64
 		var err error
+
 		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
 			i++
 			if i%100 == 0 {
@@ -888,7 +895,11 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	return req, nil
 }
 
-// 专门用一个线程(goroutine)来处理 write
+// 专门用一个线程(goroutine)来处理 write.
+// 这里进行的任务如下:
+// 1. 用户会有 db.writeCh 发送请求, 这个请求的结构是 request, 可能是同一个事务的一批请求.
+// 2. 有一个 blocking channel 来表示目前正在写入的 Batch 的状态，剩下的添加到 reqs 中
+// 3. 当 blocking channel 结束的时候，占据 blocking channel, 然后开始写入, 写入的时候, 异步调用 writeRequests, 这里面会走到 db.writeRequests.
 func (db *DB) doWrites(lc *z.Closer) {
 	defer lc.Done()
 	pendingCh := make(chan struct{}, 1)
@@ -992,6 +1003,13 @@ func (db *DB) batchSetAsync(entries []*Entry, f func(error)) error {
 var errNoRoom = errors.New("No room for write")
 
 // ensureRoomForWrite is always called serially.
+//
+// TODO(mwish): lock 这里会保护什么?
+// 1. memtable not full, return
+// 2. 如果 flushChan 无法立刻 send, 表示 pending memtable 到达上界, 返回 no mem, 否则变成 immutable 的, 丢给
+//  db.flushChan
+//
+// 然后比较有趣的一点是, ensureRoomForWrite 这里只实现了 err, 没有实现 Write Stall. 为什么呢? 感觉这里是认为写入瓶颈不会走到 Compaction 这里, 而是走到 vLog 上?
 func (db *DB) ensureRoomForWrite() error {
 	var err error
 	db.lock.Lock()
@@ -1007,6 +1025,7 @@ func (db *DB) ensureRoomForWrite() error {
 		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
 			db.mt.sl.MemSize(), len(db.flushChan))
 		// We manage to push this task. Let's modify imm.
+		// imm 列表应该是被保护的
 		db.imm = append(db.imm, db.mt)
 		db.mt, err = db.newMemTable()
 		if err != nil {
@@ -1090,6 +1109,7 @@ func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
 	if ft.itr != nil {
 		iter = ft.itr
 	} else {
+		// 这是什么几把抽象泄露...
 		iter = ft.mt.sl.NewUniIterator(false)
 	}
 	defer iter.Close()
@@ -1109,10 +1129,15 @@ func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
 	return b
 }
 
+// 具体的 flushTask
 type flushTask struct {
-	mt           *memTable
-	cb           func()
-	itr          y.Iterator
+	// immutable memtable
+	mt *memTable
+	// TODO(mwish): 这个会挂什么类型的 func 呢?
+	cb func()
+	// 这里是一个 merging iterator
+	itr y.Iterator
+	// TODO(mwish): 这里会挂什么呢？
 	dropPrefixes [][]byte
 }
 
@@ -1151,6 +1176,8 @@ func (db *DB) handleFlushTask(ft flushTask) error {
 
 // flushMemtable must keep running until we send it an empty flushTask. If there
 // are errors during handling the flush task, we'll retry indefinitely.
+//
+// flushMemtable 函数运行 flush 线程.
 func (db *DB) flushMemtable(lc *z.Closer) error {
 	defer lc.Done()
 
@@ -1180,6 +1207,7 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 		}
 	}
 
+	// 感觉这里会把很多 Input mt 全部写到同一个 L0 file, 不知道 RocksDB 是怎么搞的
 	for ft := range db.flushChan {
 		if ft.mt == nil {
 			// We close db.flushChan now, instead of sending a nil ft.mt.

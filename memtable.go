@@ -47,7 +47,7 @@ import (
 type memTable struct {
 	// 这里有一份内存 skiplist.
 	// TODO: Give skiplist z.Calloc'd []byte.
-	sl         *skl.Skiplist
+	sl *skl.Skiplist
 	// 这里还是有一份 wal.
 	wal        *logFile
 	maxVersion uint64
@@ -173,6 +173,7 @@ func (mt *memTable) SyncWAL() error {
 	return mt.wal.Sync()
 }
 
+// 这里比较奇怪, 保证 memtable 和 wal 大小均不超过 MemtableSize, 如果有一个超过了, 就会尝试 flush mem
 func (mt *memTable) isFull() bool {
 	if mt.sl.MemSize() >= mt.opt.MemTableSize {
 		return true
@@ -194,6 +195,8 @@ func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
 	}
 
 	// wal is nil only when badger in running in in-memory mode and we don't need the wal.
+	//
+	// 感觉这里 wal 是一个优化, 而不是正确性. 小 value 还是正常 LSM, 同时也希望能够快速恢复.
 	if mt.wal != nil {
 		// If WAL exceeds opt.ValueLogFileSize, we'll force flush the memTable. See logic in
 		// ensureRoomForWrite.

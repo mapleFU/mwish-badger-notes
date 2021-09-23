@@ -103,6 +103,7 @@ func (item *Item) Value(fn func(val []byte) error) error {
 		}
 		return item.err
 	}
+	// 绷不住了, 这啥玩意.
 	buf, cb, err := item.yieldItemValue()
 	defer runCallback(cb)
 	if err != nil {
@@ -149,6 +150,7 @@ func (item *Item) DiscardEarlierVersions() bool {
 	return item.meta&BitDiscardEarlierVersions > 0
 }
 
+// 这个函数永远不会返回 Error, 最多 log error.
 func (item *Item) yieldItemValue() ([]byte, func(), error) {
 	key := item.Key() // No need to copy.
 	if !item.hasValue() {
@@ -159,6 +161,7 @@ func (item *Item) yieldItemValue() ([]byte, func(), error) {
 		item.slice = new(y.Slice)
 	}
 
+	// 如果数据 inline, 直接返回.
 	if (item.meta & bitValuePointer) == 0 {
 		val := item.slice.Resize(len(item.vptr))
 		copy(val, item.vptr)
@@ -168,6 +171,7 @@ func (item *Item) yieldItemValue() ([]byte, func(), error) {
 	var vp valuePointer
 	vp.Decode(item.vptr)
 	db := item.txn.db
+	// 从 vLog 里面读.
 	result, cb, err := db.vlog.Read(vp, item.slice)
 	if err != nil {
 		db.opt.Logger.Errorf("Unable to read: Key: %v, Version : %v, meta: %v, userMeta: %v"+

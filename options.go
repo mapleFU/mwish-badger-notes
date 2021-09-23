@@ -51,18 +51,18 @@ type Options struct {
 	// Usually modified options.
 
 	// 写入是否是 sync 的, 应该是约束了 fsync.
-	SyncWrites        bool
+	SyncWrites bool
 	// 需要保持的版本数目.
 	// TODO(mwish): 似乎 badger 有 MVCC, 但我们不知道这个逻辑具体是给谁/做什么的.
 	NumVersionsToKeep int
 	ReadOnly          bool
 	Logger            Logger
 	// zstd/snappy/不压缩
-	Compression       options.CompressionType
-	InMemory          bool
+	Compression options.CompressionType
+	InMemory    bool
 	// 收集 metrics 信息
 	// TODO(mwish): 这里 metrics 是打给谁的呢.
-	MetricsEnabled    bool
+	MetricsEnabled bool
 	// Sets the Stream.numGo field
 	NumGoroutines int
 
@@ -84,9 +84,9 @@ type Options struct {
 	BlockSize          int
 	BloomFalsePositive float64
 	// BlockCache 是 Block 的缓存
-	BlockCacheSize     int64
+	BlockCacheSize int64
 	// IndexCache 比 BlockCache 轻量，属于 Index 的缓存.
-	IndexCacheSize     int64
+	IndexCacheSize int64
 
 	NumLevelZeroTables      int
 	NumLevelZeroTablesStall int

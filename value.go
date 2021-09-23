@@ -452,7 +452,7 @@ type valueLog struct {
 	// guards our view of which files exist, which to be deleted, how many active iterators
 	filesLock        sync.RWMutex
 	filesMap         map[uint32]*logFile // guard by filesLock
-	maxFid           uint32 // guard by filesLock
+	maxFid           uint32              // guard by filesLock
 	filesToBeDeleted []uint32
 	// A refcount of iterators -- when this hits zero, we can delete the filesToBeDeleted.
 	numActiveIterators int32
@@ -797,7 +797,7 @@ func estimateRequestSize(req *request) uint64 {
 	return size
 }
 
-// valueLog.write 只会被 db 单线程写.
+// valueLog.write 只会被 db 单线程写. 如果是 sync 写入模式, 在结束之前一定会调用 `sync`.
 //
 // write is thread-unsafe by design and should not be called concurrently.
 func (vlog *valueLog) write(reqs []*request) error {
@@ -870,7 +870,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 	for i := range reqs {
 		b := reqs[i]
 		// clear ptrs.
-		// ptr 指向对应的 Buf.
+		// ptr 指向对应的文件内容, 如果 Ptrs 是默认值, 代表它存储的内容 inline 了.
 		b.Ptrs = b.Ptrs[:0]
 		var written, bytesWritten int
 		valueSizes := make([]int64, 0, len(b.Entries))

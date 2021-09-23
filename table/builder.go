@@ -214,6 +214,7 @@ func (b *Builder) keyDiff(newKey []byte) []byte {
 	return newKey[i:]
 }
 
+// 这里实现了前缀压缩, 来做一些前缀相关的任务.
 func (b *Builder) addHelper(key []byte, v y.ValueStruct, vpLen uint32) {
 	b.keyHashes = append(b.keyHashes, y.Hash(y.ParseKey(key)))
 
@@ -342,6 +343,7 @@ func (b *Builder) Add(key []byte, value y.ValueStruct, valueLen uint32) {
 	b.addInternal(key, value, valueLen, false)
 }
 
+// 这个就嗯往一个 SSTable 文件里面加，好像没有限制大小.
 func (b *Builder) addInternal(key []byte, value y.ValueStruct, valueLen uint32, isStale bool) {
 	if b.shouldFinishBlock(key, value) {
 		if isStale {

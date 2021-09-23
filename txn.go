@@ -46,9 +46,9 @@ type oracle struct {
 
 	// Either of these is used to determine which versions can be permanently
 	// discarded during compaction.
-	discardTs uint64       // Used by ManagedDB.
+	discardTs uint64 // Used by ManagedDB.
 	// 相当于读的水位
-	readMark  *y.WaterMark // Used by DB.
+	readMark *y.WaterMark // Used by DB.
 
 	// committedTxns contains all committed writes (contains fingerprints
 	// of keys written and their latest commit counter).
@@ -267,10 +267,10 @@ type Txn struct {
 	readTs   uint64
 	commitTs uint64
 	//
-	size     int64
-	count    int64
+	size  int64
+	count int64
 	// 绑定的 db 对象, 读的起源.
-	db       *DB
+	db *DB
 
 	// 这里的读取不采用 key set, 采用 fingerprint, 这里不会误判, 但是可能有 false positive.
 	// 这个是为写事务准备的 read set.
@@ -286,7 +286,7 @@ type Txn struct {
 	discarded    bool
 	doneRead     bool
 	// 是否是更新的事务.
-	update       bool // update is used to conditionally keep track of reads.
+	update bool // update is used to conditionally keep track of reads.
 }
 
 type pendingWritesIterator struct {
@@ -502,6 +502,7 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 	}
 
 	item = new(Item)
+	// 如果是写事务，从读写集中拿出对应结果.
 	if txn.update {
 		if e, has := txn.pendingWrites[string(key)]; has && bytes.Equal(key, e.Key) {
 			if isDeletedOrExpired(e.meta, e.ExpiresAt) {
@@ -523,6 +524,7 @@ func (txn *Txn) Get(key []byte) (item *Item, rerr error) {
 		txn.addReadKey(key)
 	}
 
+	// 根据 ts 来读出对应内容.
 	seek := y.KeyWithTs(key, txn.readTs)
 	vs, err := txn.db.get(seek)
 	if err != nil {
@@ -751,8 +753,8 @@ type txnCb struct {
 	// commit hook.
 	commit func() error
 	// 用户处理 error 的 hook.
-	user   func(error)
-	err    error
+	user func(error)
+	err  error
 }
 
 func runTxnCallback(cb *txnCb) {

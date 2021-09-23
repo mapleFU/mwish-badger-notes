@@ -1,3 +1,4 @@
+//go:build !windows && !plan9
 // +build !windows,!plan9
 
 /*
@@ -28,6 +29,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// 这里抽象了不同系统对文件的文件锁, 然后这里一般是 Lock 目录
+//
 // directoryLockGuard holds a lock on a directory and a pid file inside.  The pid file isn't part
 // of the locking mechanism, it's just advisory.
 type directoryLockGuard struct {
