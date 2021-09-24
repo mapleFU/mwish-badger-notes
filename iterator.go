@@ -40,6 +40,8 @@ const (
 
 // Item is returned during iteration. Both the Key() and Value() output is only valid until
 // iterator.Next() is called.
+//
+// Value() 会返回对应的逻辑
 type Item struct {
 	key       []byte
 	vptr      []byte
@@ -52,6 +54,7 @@ type Item struct {
 	txn   *Txn
 
 	err      error
+	// 可能有些目标会正在 prefetch.
 	wg       sync.WaitGroup
 	status   prefetchStatus
 	meta     byte // We need to store meta to know about bitValuePointer.
@@ -440,14 +443,19 @@ var DefaultIteratorOptions = IteratorOptions{
 }
 
 // Iterator helps iterating over the KV pairs in a lexicographically sorted order.
+// 这个是暴露给外层的, 内部依赖 y.Iterator.
 type Iterator struct {
+	// 这个有点类似 leveldb 的 Iterator 接口,
 	iitr   y.Iterator
 	txn    *Txn
 	readTs uint64
 
 	opt   IteratorOptions
 	item  *Item
+	// 存放的数据块, data 可以被看作是 prefetch sequence.
 	data  list
+	// pool block, 这个内容比较诡异, 在 newItem 的时候会复用它
+	// 然后, 放进 waste 列表之前会处理 wg.Done, 防止 prefetch 进行的时候处理
 	waste list
 
 	lastKey []byte // Used to skip over multiple versions of the same key.
@@ -589,6 +597,7 @@ func (it *Iterator) Next() {
 		return
 	}
 	// Reuse current item
+	// 这里也是需要等待 wg 完全消耗.
 	it.item.wg.Wait() // Just cleaner to wait before pushing to avoid doing ref counting.
 	it.scanned += len(it.item.key) + len(it.item.val) + len(it.item.vptr) + 2
 	it.waste.push(it.item)
@@ -621,6 +630,8 @@ func isDeletedOrExpired(meta byte, expiresAt uint64) bool {
 // or it has pushed an item into it.data list, else it returns false.
 //
 // This function advances the iterator.
+//
+// parse item 还会做 prefetch.
 func (it *Iterator) parseItem() bool {
 	mi := it.iitr
 	key := mi.Key()
@@ -724,6 +735,7 @@ func (it *Iterator) fill(item *Item) {
 
 	item.vptr = y.SafeCopy(item.vptr, vs.Value)
 	item.val = nil
+	// 异步去做 prefetch
 	if it.opt.PrefetchValues {
 		item.wg.Add(1)
 		go func() {
@@ -735,6 +747,7 @@ func (it *Iterator) fill(item *Item) {
 }
 
 func (it *Iterator) prefetch() {
+	// 使用配置的 prefetch size.
 	prefetchSize := 2
 	if it.opt.PrefetchValues && it.opt.PrefetchSize > 1 {
 		prefetchSize = it.opt.PrefetchSize
@@ -764,6 +777,8 @@ func (it *Iterator) Seek(key []byte) uint64 {
 	if len(key) > 0 {
 		it.txn.addReadKey(key)
 	}
+	// Seek 后, 原本的 data 需要丢给 waste, 作为可以 reuse 的列表
+	// 丢到 waste 之前需要 wg.Wait()
 	for i := it.data.pop(); i != nil; i = it.data.pop() {
 		i.wg.Wait()
 		it.waste.push(i)

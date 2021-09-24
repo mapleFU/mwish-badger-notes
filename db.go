@@ -795,7 +795,8 @@ func (db *DB) writeToLSM(b *request) error {
 			return y.Wrapf(err, "while writing to memTable")
 		}
 	}
-	// TODO(mwish): WAL 和 vLog 有什么区别? 为什么都在 mt 上?
+	// Q: WAL 和 vLog 有什么区别? 为什么都在 mt 上?
+	// A: 这里面有一些小 key-value, 会不落 vLog, 直接写到 LSM + MT 上.
 	if db.opt.SyncWrites {
 		return db.mt.SyncWAL()
 	}
