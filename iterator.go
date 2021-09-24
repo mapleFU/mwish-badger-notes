@@ -774,6 +774,7 @@ func (it *Iterator) Seek(key []byte) uint64 {
 	if len(key) > 0 {
 		it.txn.addReadKey(key)
 	}
+	// Seek 后, 原本的 data 需要丢给 waste, 作为浪费掉的值.
 	for i := it.data.pop(); i != nil; i = it.data.pop() {
 		i.wg.Wait()
 		it.waste.push(i)
