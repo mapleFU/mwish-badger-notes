@@ -454,6 +454,8 @@ type Iterator struct {
 	item  *Item
 	// 存放的数据块, data 可以被看作是 prefetch sequence.
 	data  list
+	// pool block, 这个内容比较诡异, 在 newItem 的时候会复用它
+	// 然后, 放进 waste 列表之前会处理 wg.Done, 防止 prefetch 进行的时候处理
 	waste list
 
 	lastKey []byte // Used to skip over multiple versions of the same key.
@@ -595,6 +597,7 @@ func (it *Iterator) Next() {
 		return
 	}
 	// Reuse current item
+	// 这里也是需要等待 wg 完全消耗.
 	it.item.wg.Wait() // Just cleaner to wait before pushing to avoid doing ref counting.
 	it.scanned += len(it.item.key) + len(it.item.val) + len(it.item.vptr) + 2
 	it.waste.push(it.item)
@@ -774,7 +777,8 @@ func (it *Iterator) Seek(key []byte) uint64 {
 	if len(key) > 0 {
 		it.txn.addReadKey(key)
 	}
-	// Seek 后, 原本的 data 需要丢给 waste, 作为浪费掉的值.
+	// Seek 后, 原本的 data 需要丢给 waste, 作为可以 reuse 的列表
+	// 丢到 waste 之前需要 wg.Wait()
 	for i := it.data.pop(); i != nil; i = it.data.pop() {
 		i.wg.Wait()
 		it.waste.push(i)
