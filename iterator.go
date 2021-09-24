@@ -40,6 +40,8 @@ const (
 
 // Item is returned during iteration. Both the Key() and Value() output is only valid until
 // iterator.Next() is called.
+//
+// Value() 会返回对应的逻辑
 type Item struct {
 	key       []byte
 	vptr      []byte
@@ -52,6 +54,7 @@ type Item struct {
 	txn   *Txn
 
 	err      error
+	// 可能有些目标会正在 prefetch.
 	wg       sync.WaitGroup
 	status   prefetchStatus
 	meta     byte // We need to store meta to know about bitValuePointer.
@@ -440,13 +443,16 @@ var DefaultIteratorOptions = IteratorOptions{
 }
 
 // Iterator helps iterating over the KV pairs in a lexicographically sorted order.
+// 这个是暴露给外层的, 内部依赖 y.Iterator.
 type Iterator struct {
+	// 这个有点类似 leveldb 的 Iterator 接口,
 	iitr   y.Iterator
 	txn    *Txn
 	readTs uint64
 
 	opt   IteratorOptions
 	item  *Item
+	// 存放的数据块, data 可以被看作是 prefetch sequence.
 	data  list
 	waste list
 
@@ -621,6 +627,8 @@ func isDeletedOrExpired(meta byte, expiresAt uint64) bool {
 // or it has pushed an item into it.data list, else it returns false.
 //
 // This function advances the iterator.
+//
+// parse item 还会做 prefetch.
 func (it *Iterator) parseItem() bool {
 	mi := it.iitr
 	key := mi.Key()
@@ -724,6 +732,7 @@ func (it *Iterator) fill(item *Item) {
 
 	item.vptr = y.SafeCopy(item.vptr, vs.Value)
 	item.val = nil
+	// 异步去做 prefetch
 	if it.opt.PrefetchValues {
 		item.wg.Add(1)
 		go func() {
@@ -735,6 +744,7 @@ func (it *Iterator) fill(item *Item) {
 }
 
 func (it *Iterator) prefetch() {
+	// 使用配置的 prefetch size.
 	prefetchSize := 2
 	if it.opt.PrefetchValues && it.opt.PrefetchSize > 1 {
 		prefetchSize = it.opt.PrefetchSize
