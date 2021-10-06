@@ -116,6 +116,7 @@ type DB struct {
 	flushChan chan flushTask // For flushing memtables.
 	closeOnce sync.Once      // For closing DB only once.
 
+	// 这里表面上是一个 i32, 实际上是个 0/1 状态机. 表示是否有正在进行的 blockingWrite.
 	blockWrites int32
 	isClosed    uint32
 
@@ -867,9 +868,11 @@ func (db *DB) writeRequests(reqs []*request) error {
 }
 
 func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
+	// 检查没有正在进行的 blockWrite
 	if atomic.LoadInt32(&db.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
 	}
+	// 检查事务是否过大 (我很好奇为什么他麻痹要在这检查).
 	var count, size int64
 	for _, e := range entries {
 		size += e.estimateSizeAndSetThreshold(db.valueThreshold())
@@ -882,7 +885,7 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	// We can only service one request because we need each txn to be stored in a contigous section.
 	// Txns should not interleave among other txns or rewrites.
 	//
-	// 这里从池子里拿, req 是需要同步的. 这里也通过 wg 来同步.
+	// 这里从池子里拿, req 是需要同步的. 这里也通过 wg 来同步. 然后保证放进去的一定是没有东西等着的.
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.Entries = entries
@@ -1761,6 +1764,7 @@ func (db *DB) Flatten(workers int) error {
 	}
 }
 
+// 阻塞写入, 一旦有的话会设置 db.blockWrites, 阻止其他的写.
 func (db *DB) blockWrite() error {
 	// Stop accepting new writes.
 	if !atomic.CompareAndSwapInt32(&db.blockWrites, 0, 1) {

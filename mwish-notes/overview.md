@@ -201,10 +201,12 @@ func (txn *Txn) Commit() error {
 ```
 
 1. 检查是否没写入、是否有重复提交
-2. `commitAndSend` 是最主要的逻辑，这里会保证写入 `writeCh` 的事务的 commit ts 是顺序的。
-3. 调用 `oracle.newCommitTs` , oracle 会维护一个
-4. 给事务的 key 编码上版本（以 bigendian u64 的形式），然后加上 FinTxn 的食物
-5. 
+2. `commitAndSend` 是最主要的逻辑，这里会保证写入 `writeCh` 的事务的 commit ts 是单调的。
+3. 调用 `oracle.newCommitTs` , oracle 会维护: 事务冲突 + 读写水位, 然后逻辑上是线程安全的.
+4. 给事务的 key 编码上版本（以 bigendian u64 的形式），然后加上 FinTxn 的事务
+5. 调用 `commitAndSend`, 这里要用确定的时序发送给写入 Memtable 和 LSM 的线程.
+6. 看是否成功.
+
 
 我们看看 Oracle 维护的水位：
 
@@ -242,7 +244,109 @@ type oracle struct {
 
 老样子，managed mode 我们不管。重要的是：
 
-1. `committedTxns`, 一个模糊的事务冲突表。为什么说是模糊的呢？有亮点原因
+1. `committedTxns`, 一个模糊的事务冲突表。为什么说是模糊的呢？有两点原因:
+   1. 原因 1 是, 事务相关的 `committedTxns` 都是 fingerprint, 而不是完善的事务纪录(不过也没啥关系).
+   2. 在 `newCommitTs` 函数调用的时候, 这里只判断了冲突, 没有管这个事务后续是 commit 了还是 abort 了, 就留在了事务表里
+2. `nextTxnTs`, 这个值是和 `txnMark` 联动的. 表示提交事务的下一个 ts, 不过比较好玩的是, 这里事务也是会失败的. (TODO(mwish): 这里失败会把这个事务 nextTxnTs 恢复吗?)
+3. `lastCleanupTs` 和 `readMark` 有关, 是 `committedTxns` GC 有关的, 表示上一次对 `committedTxns` GC 的时间.
+
+那么, 虽然讲述的位置怪怪的, 但我们复习一下这两个水位是怎么维护的:
+
+### 读和读写事务
+
+读需要拿到一个对应的 readTs, 这里调用了 `oracle.readTs`, 这里 `readTs = o.nextTxnTs - 1`, 然后最有意思的是, `o.txnMark.WaitForMark(context.Background(), readTs)`. 这里表面上很好理解, *不带锁* 等待写事务 `o.nextTxnTs - 1` 结束嘛, 很简单. 欸但是问题来了, 这里为什么要等待呢?
+
+答案要在读写事务寻找, 写事务会先拿到一个 `readTs`, 就走上面这段的逻辑。然后提交的时候在 `o.newCommitTs`, 这里逻辑如下:
+
+1. 检查是否冲突, 有冲突就 abort 掉了
+2. 对读事务 resolve, 这里有点 confusing, 这里终止了事务的读阶段, 然后提高了 `nextTxnTs`, 让事务去完成剩下的阶段. 我们回到读这里, `readTs` 拿到的是 "最近的一个准备写入的事务" 的 ts, 感觉极端写入场景下, 读写串行感觉不是很好？
+
+以上就是事务的读写流程.
+
+### 事务的提交
+
+`Txn.commitAndSend` 维护了对 `writeCh` 的写, 并把结果的处理封装到了返回的 `txnCb` 里面. 这里 explicit 的调用了 `orc.writeCh` 来保证顺序性. 我们上面已经贴了部分流程了:
+
+1. `commitAndSend` 是最主要的逻辑，这里会保证写入 `writeCh` 的事务的 commit ts 是单调的。
+2. 调用 `oracle.newCommitTs` , oracle 会维护: 事务冲突 + 读写水位, 然后逻辑上是线程安全的.
+3. 给事务的 key 编码上版本（以 bigendian u64 的形式), 给事务加上 txn 的标记, 然后加上 FinTxn 的事务
+4. 调用 `db.sendToWriteCh`, 这里要用确定的时序发送给写入 Memtable 和 LSM 的线程.
+5. 调用 `doneCommit`, 这里会恢复水位, 通知卡着的读事务.
+
+`db.sendToWriteCh` 也很有意思, 还用到了 pool, 自己管理了一堆逻辑. 这里给写入做了一些限制(可能返回错误, 不过我觉得概率不会很高), 然后从 pool 里面拿出了一个 `request*` 对象:
+
+```go
+type request struct {
+	// Input values
+	Entries []*Entry
+	// Output values and wait group stuff below
+	Ptrs []valuePointer
+	Wg   sync.WaitGroup
+	Err  error
+	ref  int32
+}
+```
+
+`sendToWriteCh` 签名如下:
+
+```go
+func (db *DB) sendToWriteCh(entries []*Entry) (*request, error)
+```
+
+可以看到, 这里送进来的是归属于同一个事务、带 `bitTxn` 的事务组, 和一个 `bitTxnFin`. 这里初始化的时候, 逻辑如下:
+
+```go
+req := requestPool.Get().(*request)
+req.reset()
+req.Entries = entries
+req.Wg.Add(1)
+req.IncrRef()     // for db write
+db.writeCh <- req // Handled in doWrites.
+```
+
+这里 `requestPool` 要保证调用的时候, 里面内容全是空的(包括 wg, ref, 其他内容倒是无所谓). 然后这里丢给 `req.Entries`, `Ptrs` 目前没有初始化. 然后发给 `writeCh` .
+
+然后我们且看 `DB.doWrites`, 这个地方起了一个 goroutine 来处理任务. 这里与外部的 `writeCh` 和 `Closer` 交互, 内部创建了一个 `pendingCh`, pending 的时候, `request` 会被打包到一起:
+
+```go
+reqs = append(reqs, r)
+reqLen.Set(int64(len(reqs)))
+```
+
+这里 `reqLen` 太长也会阻塞. 然后, 要写入的时候, 这里会占据 `pendingCh`, 直到写完:
+
+```go
+writeRequests := func(reqs []*request) {
+	if err := db.writeRequests(reqs); err != nil {
+		db.opt.Errorf("writeRequests: %v", err)
+	}
+	<-pendingCh
+}
+```
+
+具体写入的时候:
 
 
+```go
+writeCase:
+	go writeRequests(reqs)
+	// 为写创建空间.
+	reqs = make([]*request, 0, 10)
+	reqLen.Set(0)
+```
+
+这里把写入委托给了下面的函数, 注意参数已经变成了 `request` 的数组了:
+
+```go
+// writeRequests is called serially by only one goroutine.
+func (db *DB) writeRequests(reqs []*request) error
+```
+
+这个函数内容是写 vLog (`db.vlog.write(reqs)`) -> 对每个请求写 LSM (`for every b in req: db.writeToLSM(b)`). 比较有意思的还有这个单独 `writeToLSM`, 感觉主要是因为每个内容都很小, 独立写就独立写了(LevelDB 搞成了一整个二进制再写). 我们来看看细节吧:
+
+
+(TODO(mwish): here)
+
+
+## 读取
 
