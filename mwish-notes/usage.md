@@ -35,9 +35,9 @@ type Options struct {...}
 
 这里允许使用 in-memory 模式，但是我们对这个模式没那么感兴趣。这里还有个 `IndexCache`, 作为缓存。
 
-同时，系统还可以开启加密模式 `Encryption Mode`, 在启动的时候，codec 代价会变高，所以推荐打开 IndexCache.
+同时，系统还可以开启加密模式 `Encryption Mode`, 在启动的时候，codec 代价会变高，所以推荐打开 IndexCache，作为文件相关的基础缓存
 
-这里读写和 bolt 差不多：
+这里读写和 bolt 表面上差不多：
 
 ```go
 // 只读
@@ -53,9 +53,11 @@ err := db.Update(func(txn *badger.Txn) error {
 })
 ```
 
+但是实际上，读的时候，Bolt 这些应该拿到的是完整的 `key/value` 对，而 badger 拿到的是一个 `Item`, 这个 Item 会存在，是因为 prefetch 等至关重要的优化。以及 badger 引擎的限制。
+
 这里的内部操作的都是 kv-pair 的形式。这里应该有 `txn.Set` `txn.Get` 等处理 kv 的内容。`DB.GetSequence` 可以获得一个 seq 来处理内容。
 
-很奇怪的是，这里还支持了 `MergeOperator`, 这个东西相当于用户层的支持 rwn:
+很奇怪的是，这里还支持了 `MergeOperator`, 这个东西相当于用户层的支持 rwn，即用户定义对某个值的 读-改-写badger 的流程。这个应该是引擎上层的工作。
 
 ```go
 // Merge function to append one byte slice to another

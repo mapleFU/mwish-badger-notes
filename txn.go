@@ -42,6 +42,7 @@ type oracle struct {
 	nextTxnTs   uint64
 
 	// Used to block NewTransaction, so all previous commits are visible to a new read.
+	// 写的水位，比读的水位高
 	txnMark *y.WaterMark
 
 	// Either of these is used to determine which versions can be permanently
@@ -405,7 +406,8 @@ func ValidEntry(db *DB, key, val []byte) error {
 
 // 根据 txn 的 flag 来处理 `Entry`, 这里有两个部分:
 // 1. 根据 txn 的信息, 和 key, value 来检查 Entry 的 kv 是否合法.
-// 2.
+// 2. 如果要检测冲突冲突，把 Key 注册到 conflictKeys 中
+// 3. 把写入注册到 pendingWrites 中, 返回
 func (txn *Txn) modify(e *Entry) error {
 	switch {
 	case !txn.update:
@@ -691,7 +693,7 @@ func (txn *Txn) commitPrecheck() error {
 		}
 	}
 
-	// TODO(mwish): managedTxns 是什么 jb 逻辑啊...
+	// managedTxns 是外部管理 txn 的逻辑，不想管了
 	//
 	// If keepTogether is True, it implies transaction markers will be added.
 	// In that case, commitTs should not be never be zero. This might happen if
@@ -738,6 +740,7 @@ func (txn *Txn) Commit() error {
 	}
 	defer txn.Discard()
 
+	// 发送到 LSMTree 和 memtable, 来执行写.
 	txnCb, err := txn.commitAndSend()
 	if err != nil {
 		return err
