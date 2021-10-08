@@ -294,7 +294,8 @@ func (lf *logFile) Truncate(end int64) error {
 	return lf.MmapFile.Truncate(end)
 }
 
-// 具体内容都会写到 Buf 中. 返回 length.
+// 具体内容都会写到 Buf 中. 返回 length. 这个地方 tee 了一个输出流到 CRC, 然后用这个 tee 的结果
+// 来写 CRC.
 //
 // encodeEntry will encode entry to the buf
 // layout of entry

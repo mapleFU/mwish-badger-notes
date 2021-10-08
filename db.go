@@ -113,11 +113,13 @@ type DB struct {
 	lc        *levelsController
 	vlog      valueLog
 	writeCh   chan *request
+	// flushChan 保证正在 flush 的 memtable 不超过 db.opt.NumMemtables
 	flushChan chan flushTask // For flushing memtables.
 	closeOnce sync.Once      // For closing DB only once.
 
 	// 这里表面上是一个 i32, 实际上是个 0/1 状态机. 表示是否有正在进行的 blockingWrite.
 	blockWrites int32
+	// 我真的操了, 为啥前面 i32 后面 u32, 你麻痹没有 atomic_bool ?
 	isClosed    uint32
 
 	orc              *oracle
@@ -819,7 +821,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 	}
 	db.opt.Debugf("writeRequests called. Writing to value log")
 	// 先写 vLog, 写的对象是 requests
-	// 然后比较有意思的是, vLog 写成功然后后续失败感觉也没啥关系.
+	// 然后比较有意思的是, vLog 写成功然后后续失败感觉也没啥关系, 这里也没有什么 write stall.
 	err := db.vlog.write(reqs)
 	if err != nil {
 		done(err)
@@ -834,6 +836,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 	// 串行写 memtable:
 	// 1. 确保空间足够. 这里比较有意思的是, 没有 WriteStall 降速.
 	// 2. writeToLSM 来写具体内容.
+	// 3. 写入的时候(包括写 vLog + mem+wal) 都是独立串行的.
 	for _, b := range reqs {
 		if len(b.Entries) == 0 {
 			continue
@@ -842,6 +845,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 		var i uint64
 		var err error
 
+		// 如果没有空间, 就一直睡 10ms 睡死在这里.
 		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
 			i++
 			if i%100 == 0 {
@@ -1013,7 +1017,9 @@ var errNoRoom = errors.New("No room for write")
 // 2. 如果 flushChan 无法立刻 send, 表示 pending memtable 到达上界, 返回 no mem, 否则变成 immutable 的, 丢给
 //  db.flushChan
 //
-// 然后比较有趣的一点是, ensureRoomForWrite 这里只实现了 err, 没有实现 Write Stall. 为什么呢? 感觉这里是认为写入瓶颈不会走到 Compaction 这里, 而是走到 vLog 上?
+// 然后比较有趣的一点是, ensureRoomForWrite 这里只实现了 err, 没有实现 WriteStall. 为什么呢?
+// 感觉这里是认为写入瓶颈不会走到 Compaction 这里, 而是走到 vLog 上? (如果都是小 kv, 感觉会失去 Write Stall 的能力, 不过反之要整合)
+// (WriteStall 可以主动让写入降速, 减少上游写入, 但是有让上游没有反馈的情况下, 写入堆积的风险).
 func (db *DB) ensureRoomForWrite() error {
 	var err error
 	db.lock.Lock()
@@ -1024,6 +1030,9 @@ func (db *DB) ensureRoomForWrite() error {
 		return nil
 	}
 
+	// non-blocking.
+	// if memtable becomes full, trying to send to flushChan.
+	// (不过这个地方很好玩, 这个地方不应该是写满之后送进去吗...而是要下次写入来 trigger).
 	select {
 	case db.flushChan <- flushTask{mt: db.mt}:
 		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
