@@ -804,6 +804,8 @@ func estimateRequestSize(req *request) uint64 {
 // vLog 用 mmap 读写, 写完之后 msync. 如果文件开的大小不够, 用 ftruncate 来映射. 因为这里不会从 vLog 中恢复,
 // 所以 vLog 多大就多大.
 //
+// 这里面会短暂上 `valueLog.filesLock`, 外部应该会保证 valueLog 只有一个 writer.
+//
 // write is thread-unsafe by design and should not be called concurrently.
 func (vlog *valueLog) write(reqs []*request) error {
 	if vlog.db.opt.InMemory || vlog.db.opt.managedTxns {

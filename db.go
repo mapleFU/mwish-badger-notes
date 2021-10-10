@@ -765,13 +765,18 @@ var requestPool = sync.Pool{
 	},
 }
 
+// writeToLSM 的单位是 request. 这点本身没什么问题, 但是这里会 SyncWAL, 感觉有点怪
+// 感觉有点好处就是 db.lock 的粒度比较小.
+// TODO(mwish): 为什么这里要 sync WAL 呢?
+// A: 我个人感觉上是为了不影响前台 mt 的读.
 func (db *DB) writeToLSM(b *request) error {
-	// TODO(mwish): 这个 lock 保护了什么..?
+	// 这个 lock 保护了 db.mt, 让 db.mt 是一写多读的.
 	db.lock.RLock()
 	defer db.lock.RUnlock()
 	for i, entry := range b.Entries {
 		var err error
 		if db.opt.managedTxns || entry.skipVlogAndSetThreshold(db.valueThreshold()) {
+			// Note: badger 比较迷惑的一点就是, mt 包含 wal.
 			// Will include deletion / tombstone case.
 			err = db.mt.Put(entry.Key,
 				y.ValueStruct{
@@ -800,6 +805,7 @@ func (db *DB) writeToLSM(b *request) error {
 	}
 	// Q: WAL 和 vLog 有什么区别? 为什么都在 mt 上?
 	// A: 这里面有一些小 key-value, 会不落 vLog, 直接写到 LSM + MT 上.
+	// (去网上瞅了眼, 好像工业界没有人用直接全写 vLog 的优化).
 	if db.opt.SyncWrites {
 		return db.mt.SyncWAL()
 	}
@@ -820,7 +826,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 		}
 	}
 	db.opt.Debugf("writeRequests called. Writing to value log")
-	// 先写 vLog, 写的对象是 requests
+	// 先写 vLog, 写的对象是 requests (其实这里还挺容易混淆的)
 	// 然后比较有意思的是, vLog 写成功然后后续失败感觉也没啥关系, 这里也没有什么 write stall.
 	err := db.vlog.write(reqs)
 	if err != nil {
@@ -860,7 +866,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 			done(err)
 			return y.Wrap(err, "writeRequests")
 		}
-		// 具体写入的接口
+		// 具体写入的接口, 写 wal + mem
 		if err := db.writeToLSM(b); err != nil {
 			done(err)
 			return y.Wrap(err, "writeRequests")
@@ -917,6 +923,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 		if err := db.writeRequests(reqs); err != nil {
 			db.opt.Errorf("writeRequests: %v", err)
 		}
+		// 写完之后写入 pendingCh.
 		<-pendingCh
 	}
 

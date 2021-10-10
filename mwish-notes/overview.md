@@ -344,9 +344,104 @@ func (db *DB) writeRequests(reqs []*request) error
 
 这个函数内容是写 vLog (`db.vlog.write(reqs)`) -> 对每个请求写 LSM (`for every b in req: db.writeToLSM(b)`). 比较有意思的还有这个单独 `writeToLSM`, 感觉主要是因为每个内容都很小, 独立写就独立写了(LevelDB 搞成了一整个二进制再写). 我们来看看细节吧:
 
+#### Value Log
 
-(TODO(mwish): here)
+这里首先写的是 value log，比较重要的函数是：
+
+```go
+func (vlog *valueLog) write(reqs []*request) error
+```
+
+这里面会短暂上 `valueLog.filesLock`, 外部应该会保证 valueLog 只有一个 writer. 这里函数处理的参数是 `reqs`, 大概的逻辑是：
+
+1. 检查是否对得上 vlog 的分离阈值（目前版本是 1M 大小），对得上就拆出来。然后更新 request 的 `Ptrs` 字段。这里无论有没有 vlog 都会加入 `Ptrs`
+2. 写到 value log 的内容是没有 txn 相关的 meta 的
+3. 写下去的内容格式如下，我真心感觉没必要搞 varint, 不过这种东西写了也没法改了。
+
+```go
+// +--------+-----+-------+-------+
+// | header | key | value | crc32 |
+// +--------+-----+-------+-------+
+
+// header is used in value log as a header before Entry.
+// 可以把 Header 视作一个要写的数据, 两个 byte 会以 varint 的形式写入(有必要吗, 省这点？),
+// 长度由 `maxHeaderSize` 指定, kv 分离大小是 1k->1M, 所以感觉多写点东西也没啥.
+type header struct {
+	klen      uint32
+	vlen      uint32
+	expiresAt uint64
+	meta      byte
+	userMeta  byte
+}
+```
+
+vLog 大概就是这部分逻辑了，此外还有一些检查 value 大小什么的，感觉比较 trivial.
+
+#### 写入 memtable
+
+这里是前台写入最后一步，这里本来很简单，不过有些细节可以拉出来聊聊，这里大概流程如下：
+
+```
+// 串行写 memtable:
+// 1. 确保空间足够. 这里比较有意思的是, 没有 WriteStall 降速.
+// 2. writeToLSM 来写具体内容.
+// 3. 写入的时候(包括写 vLog + mem+wal) 都是独立串行的.
+```
+
+这里没有任何的 write stall, 只会在写满的时候尝试 sleep 10ms，我个人感觉是因为写入的时候，很多瓶颈理应在 value log, 但是上面没有降速感觉还是不太合理。
+
+第二个比较有意思的地方是，这里来的请求是 requests, 但是 `writeToLSM` 是单个 request 为粒度写的。
+
+```go
+// writeToLSM 的单位是 request. 这点本身没什么问题, 但是这里会 SyncWAL, 感觉有点怪
+// 感觉有点好处就是 db.lock 的粒度比较小.
+// TODO(mwish): 为什么这里要 sync WAL 呢?
+// A: 我个人感觉上是为了不影响前台 mt 的读.
+func (db *DB) writeToLSM(b *request) error {
+	// 这个 lock 保护了 db.mt, 让 db.mt 是一写多读的.
+	db.lock.RLock()
+	defer db.lock.RUnlock()
+	...
+}
+```
+
+最后，这里引入了一个 `ValueStruct`, 我们大概可以推测出 Badger 提供的模型是什么样子的了：
+
+```go
+// ValueStruct represents the value info that can be associated with a key, but also the internal
+// Meta field.
+//
+// ValueStruct 在写入 Memtable 和 WAL 的时候被启用. 感觉是 Entry 去掉了 key 包了一层.
+// 这么一看 Badger 存储的模型应该是: <Key, ValueStruct>.
+type ValueStruct struct {
+	Meta      byte
+	UserMeta  byte
+	ExpiresAt uint64
+	// Value 存储的是下面之一:
+	// 1. 指向 vLog 的 ptr
+	// 2. Value
+	// 上面两者需要靠 Meta 的 bitValuePointer 区分。
+	Value     []byte
+
+	Version uint64 // This field is not serialized. Only for internal usage.
+}
+```
+
+上面的部分讲完了前台的写入，但是没有对后台的 Compaction
+
+## Flush
+
+
+
+## Compaction
+
+
+
+## GC
+
 
 
 ## 读取
+
+
 

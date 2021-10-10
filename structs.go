@@ -42,6 +42,7 @@ func (p valuePointer) Less(o valuePointer) bool {
 	return p.Len < o.Len
 }
 
+// Note: IsZero 的时候表示这条数据 inline 了.
 func (p valuePointer) IsZero() bool {
 	return p.Fid == 0 && p.Offset == 0 && p.Len == 0
 }
@@ -63,6 +64,8 @@ func (p *valuePointer) Decode(b []byte) {
 }
 
 // header is used in value log as a header before Entry.
+// 可以把 Header 视作一个要写的数据, 两个 byte 会以 varint 的形式写入(有必要吗, 省这点？),
+// 长度由 `maxHeaderSize` 指定, kv 分离大小是 1k->1M, 所以感觉多写点东西也没啥.
 type header struct {
 	klen      uint32
 	vlen      uint32
