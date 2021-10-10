@@ -45,6 +45,7 @@ const (
 	padding = 256
 )
 
+// header 应该是单条记录的 header.
 type header struct {
 	overlap uint16 // Overlap with base key.
 	diff    uint16 // Length of the diff.

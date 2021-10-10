@@ -1019,7 +1019,8 @@ var errNoRoom = errors.New("No room for write")
 
 // ensureRoomForWrite is always called serially.
 //
-// TODO(mwish): lock 这里会保护什么?
+// Note(mwish): lock 这里会保护什么?
+// A: 对 db.mt 的操作, 这里会访问 db.mt, 有必要的时候会把内容切走.
 // 1. memtable not full, return
 // 2. 如果 flushChan 无法立刻 send, 表示 pending memtable 到达上界, 返回 no mem, 否则变成 immutable 的, 丢给
 //  db.flushChan
@@ -1123,13 +1124,29 @@ func (db *DB) NewSkiplist() *skl.Skiplist {
 	return skl.NewSkiplist(arenaSize(db.opt))
 }
 
+// 具体的 flushTask, 这里 send 进来的时候, 只能带 mt 和可选的 cb.
+// 在后续使用的时候 (`handleFlushTask` 之前), 会构建出一个 itr 作为 Merging Iterator.
+// 说实话, 我认为这个抽象做的 非 常 垃 圾.
+type flushTask struct {
+	// immutable memtable
+	// 这里在 sending channel 的时候 绝不可能是 null
+	mt *memTable
+	// TODO(mwish): 这个会挂什么类型的 func 呢?
+	cb func()
+	// 这里是一个 merging iterator
+	itr y.Iterator
+	// TODO(mwish): 这里会挂什么呢？
+	dropPrefixes [][]byte
+}
+
 // buildL0Table builds a new table from the memtable.
 func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
 	var iter y.Iterator
 	if ft.itr != nil {
 		iter = ft.itr
 	} else {
-		// 这是什么几把抽象泄露...
+		// 这是什么几把抽象泄露...原本应该外部 build iter 吧...
+		// (虽然这应该是区分单个 iter 的情况，但是我觉得真的傻逼).
 		iter = ft.mt.sl.NewUniIterator(false)
 	}
 	defer iter.Close()
@@ -1147,18 +1164,6 @@ func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
 		b.Add(iter.Key(), iter.Value(), vp.Len)
 	}
 	return b
-}
-
-// 具体的 flushTask
-type flushTask struct {
-	// immutable memtable
-	mt *memTable
-	// TODO(mwish): 这个会挂什么类型的 func 呢?
-	cb func()
-	// 这里是一个 merging iterator
-	itr y.Iterator
-	// TODO(mwish): 这里会挂什么呢？
-	dropPrefixes [][]byte
 }
 
 // handleFlushTask must be run serially.
@@ -1183,6 +1188,7 @@ func (db *DB) handleFlushTask(ft flushTask) error {
 		data := builder.Finish()
 		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
 	} else {
+		// 让 builder 输出对应的文件名.
 		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder)
 	}
 	if err != nil {
@@ -1202,9 +1208,12 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 	defer lc.Done()
 
 	var sz int64
+	// 下面这三个玩意, 每个都有 sz 个, 是 send 来的
 	var itrs []y.Iterator
 	var mts []*memTable
 	var cbs []func()
+	// slurp 函数把积存的 memtable 全都读掉, 然后构建一整个迭代器.
+	// 注意, 这里比较好玩, flushChan 的成员是 flushTask, 这里特比好玩的只接收了 flushTask 的 cb 和 mt.
 	slurp := func() {
 		for {
 			select {
@@ -1245,6 +1254,7 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 
 		// db.opt.Infof("Picked %d memtables. Size: %d\n", len(itrs), sz)
 		ft.mt = nil
+		// 这里构建了一个 Merging iterator.
 		ft.itr = table.NewMergeIterator(itrs, false)
 		ft.cb = nil
 
@@ -1253,6 +1263,8 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 			if err == nil {
 				// Update s.imm. Need a lock.
 				db.lock.Lock()
+				// 这里应该需要保证刷过来的 mt 都是顺序的.
+				//
 				// This is a single-threaded operation. ft.mt corresponds to the head of
 				// db.imm list. Once we flush it, we advance db.imm. The next ft.mt
 				// which would arrive here would match db.imm[0], because we acquire a
@@ -1261,6 +1273,7 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 				for _, mt := range mts {
 					y.AssertTrue(mt == db.imm[0])
 					db.imm = db.imm[1:]
+					// 单个 mt 来 Dec
 					mt.DecrRef() // Return memory.
 				}
 				db.lock.Unlock()
