@@ -257,6 +257,7 @@ func (b block) verifyCheckSum() error {
 
 func CreateTable(fname string, builder *Builder) (*Table, error) {
 	bd := builder.Done()
+	// newFile 拿到 mmap 文件, 把 builder 的内容拷贝到里面.
 	mf, err := newFile(fname, bd.Size)
 	if err != nil {
 		return nil, err

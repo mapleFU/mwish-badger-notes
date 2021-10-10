@@ -1188,7 +1188,7 @@ func (db *DB) handleFlushTask(ft flushTask) error {
 		data := builder.Finish()
 		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
 	} else {
-		// 让 builder 输出对应的文件名.
+		// 让 builder 输出对应的文件名, 然后输出到 sst 文件中
 		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder)
 	}
 	if err != nil {

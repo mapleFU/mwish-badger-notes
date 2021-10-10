@@ -26,6 +26,8 @@ import (
 //
 // ValueStruct 在写入 Memtable 和 WAL 的时候被启用. 感觉是 Entry 去掉了 key 包了一层.
 // 这么一看 Badger 存储的模型应该是: <Key, ValueStruct>.
+//
+// `EncodeSize()` 函数, `Encode()` 描述了写的内容.
 type ValueStruct struct {
 	Meta      byte
 	UserMeta  byte
@@ -51,6 +53,7 @@ func sizeVarint(x uint64) (n int) {
 }
 
 // EncodedSize is the size of the ValueStruct when encoded
+// value 长度 meta + usermeta + expire ( 这里可以见 ValueStruct ).
 func (v *ValueStruct) EncodedSize() uint32 {
 	sz := len(v.Value) + 2 // meta, usermeta.
 	enc := sizeVarint(v.ExpiresAt)
