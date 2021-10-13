@@ -438,6 +438,7 @@ func (b *Builder) Finish() []byte {
 
 type buildData struct {
 	blockList []*bblock
+	// flatbuffer 构建的 index 段.
 	index     []byte
 	checksum  []byte
 	Size      int
@@ -475,11 +476,17 @@ func (b *Builder) Done() buildData {
 		alloc:     b.alloc,
 	}
 
+	// 构建一个 filter 对象, 然后 buildIndex
 	var f y.Filter
 	if b.opts.BloomFalsePositive > 0 {
 		bits := y.BloomBitsPerKey(len(b.keyHashes), b.opts.BloomFalsePositive)
 		f = y.NewFilter(b.keyHashes, bits)
 	}
+	// flatbuffer 构建 index 段.
+	// 包含:
+	// 1. bloom filter.
+	// 2. blocks 偏移量
+	// 3. key 最大最小
 	index, dataSize := b.buildIndex(f)
 
 	var err error
@@ -567,6 +574,7 @@ func (b *Builder) compressData(data []byte) ([]byte, error) {
 	return nil, errors.New("Unsupported compression type")
 }
 
+// 这里比较有意思的是, 这个 index 是全局的 index, 构建这个使用 flatbuffer 构建的.
 func (b *Builder) buildIndex(bloom []byte) ([]byte, uint32) {
 	builder := fbs.NewBuilder(3 << 20)
 

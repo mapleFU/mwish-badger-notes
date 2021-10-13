@@ -1195,6 +1195,7 @@ func (db *DB) handleFlushTask(ft flushTask) error {
 		return y.Wrap(err, "error while creating table")
 	}
 	// We own a ref on tbl.
+	// flush 的时候, 触发 LevelController 的 flush.
 	err = db.lc.addLevel0Table(tbl) // This will incrRef
 	_ = tbl.DecrRef()               // Releases our ref.
 	return err
@@ -1725,6 +1726,8 @@ func (db *DB) startMemoryFlush() {
 // levels, which is necessary after a restore from backup. During Flatten, live compactions are
 // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
 // between flattening the tree and new tables being created at level zero.
+//
+// 这里是 LSMTree 的 C
 func (db *DB) Flatten(workers int) error {
 
 	db.stopCompactions()

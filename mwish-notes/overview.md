@@ -429,17 +429,11 @@ type ValueStruct struct {
 
 上面的部分讲完了前台的写入，但是没有对后台的 Compaction
 
-## Flush
-
-
-
-## Compaction
-
-
+## Flush L0
 
 ## GC
 
-
+## Compaction
 
 ## 读取
 

@@ -34,6 +34,10 @@ import (
 	"github.com/pkg/errors"
 )
 
+/*
+感觉和 LevelDB 差不多, 都是一个 base + 很多 changes.
+ */
+
 // Manifest represents the contents of the MANIFEST file in a Badger store.
 //
 // The MANIFEST file describes the startup state of the db -- all LSM files and what level they're
@@ -43,7 +47,9 @@ import (
 // and contains a sequence of ManifestChange's (file creations/deletions) which we use to
 // reconstruct the manifest at startup.
 type Manifest struct {
+	// level 对应的是 level -> 文件.
 	Levels []levelManifest
+	// 文件 id->文件元信息
 	Tables map[uint64]TableManifest
 
 	// Contains total number of creation and deletion changes in the manifest -- used to compute
@@ -62,6 +68,8 @@ func createManifest() Manifest {
 
 // levelManifest contains information about LSM tree levels
 // in the MANIFEST file.
+//
+// Level 里面的 table 集合, 里面是文件 id.
 type levelManifest struct {
 	Tables map[uint64]struct{} // Set of table id's
 }
@@ -102,6 +110,8 @@ const (
 
 // asChanges returns a sequence of changes that could be used to recreate the Manifest in its
 // present state.
+//
+// const.
 func (m *Manifest) asChanges() []*pb.ManifestChange {
 	changes := make([]*pb.ManifestChange, 0, len(m.Tables))
 	for id, tm := range m.Tables {
@@ -110,6 +120,7 @@ func (m *Manifest) asChanges() []*pb.ManifestChange {
 	return changes
 }
 
+// const, 拷贝. 感觉是调 asChanges
 func (m *Manifest) clone() Manifest {
 	changeSet := pb.ManifestChangeSet{Changes: m.asChanges()}
 	ret := createManifest()
@@ -454,6 +465,7 @@ func applyChangeSet(build *Manifest, changeSet *pb.ManifestChangeSet) error {
 	return nil
 }
 
+// 创建一个 pb 的内容.
 func newCreateChange(
 	id uint64, level int, keyID uint64, c options.CompressionType) *pb.ManifestChange {
 	return &pb.ManifestChange{

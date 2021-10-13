@@ -24,6 +24,8 @@ import (
 // PrintHistogram builds and displays the key-value size histogram.
 // When keyPrefix is set, only the keys that have prefix "keyPrefix" are
 // considered for creating the histogram
+//
+// 外部接口就是 `PrintHistogram`, 别的啥都没有, 感觉内部也没有用 histogram 做统计的逻辑.
 func (db *DB) PrintHistogram(keyPrefix []byte) {
 	if db == nil {
 		fmt.Println("\nCannot build histogram: DB is nil.")

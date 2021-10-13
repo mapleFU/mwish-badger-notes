@@ -25,10 +25,13 @@ import (
 	"github.com/dgraph-io/badger/v3/y"
 )
 
+// levelHandler 维护了 sst, 对外提供了 get/set 的语义.
+// 这里一层只会有一个 levelHandler.
 type levelHandler struct {
 	// Guards tables, totalSize.
 	sync.RWMutex
 
+	// (看上去就是个 Level Compaction). 维护每一层的信息.
 	// For level >= 1, tables are sorted by key ranges, which do not overlap.
 	// For level 0, tables are sorted by time.
 	// For level 0, newest table are at the back. Compact the oldest one first, which is at the front.

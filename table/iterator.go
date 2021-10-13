@@ -26,6 +26,7 @@ import (
 	"github.com/dgraph-io/badger/v3/y"
 )
 
+// 对 Block 设置的 iterator.
 type blockIterator struct {
 	data         []byte
 	idx          int // Idx of the entry inside a block

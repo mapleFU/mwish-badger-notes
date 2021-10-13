@@ -29,6 +29,9 @@ import (
 
 // discardStats keeps track of the amount of data that could be discarded for
 // a given logfile.
+//
+// discard 也是 vLog 相关的单独文件, 内容存在 mmap 文件中. 每个 slot 长度是 16bytes 的 <fid: I64, discard: U64>, mmap 的很大.
+// Compaction LSM 和 VLog 应该是互相影响的, vlog compaction 要写入一堆前台(所以读也要从上往下).
 type discardStats struct {
 	sync.Mutex
 
@@ -66,6 +69,10 @@ func InitDiscardStats(opt Options) (*discardStats, error) {
 	opt.Infof("Discard stats nextEmptySlot: %d\n", lf.nextEmptySlot)
 	return lf, nil
 }
+
+/*
+提供了按照文件 Id 排序的能力.
+ */
 
 func (lf *discardStats) Len() int {
 	return lf.nextEmptySlot
@@ -153,6 +160,7 @@ func (lf *discardStats) Iterate(f func(fid, stats uint64)) {
 }
 
 // MaxDiscard returns the file id with maximum discard bytes.
+// O(n), 在这硬查.
 func (lf *discardStats) MaxDiscard() (uint32, int64) {
 	lf.Lock()
 	defer lf.Unlock()

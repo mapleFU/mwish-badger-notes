@@ -48,6 +48,7 @@ type levelsController struct {
 	levels []*levelHandler
 	kv     *DB
 
+	// 这里应该暗示只能有一个线程在做 Compaction
 	cstatus compactStatus
 }
 
@@ -348,6 +349,7 @@ func (s *levelsController) dropPrefixes(prefixes [][]byte) error {
 	return nil
 }
 
+// 压缩相关的内容, Badger 使用 levelsController 来维护.
 func (s *levelsController) startCompact(lc *z.Closer) {
 	n := s.kv.opt.NumCompactors
 	lc.AddRunning(n - 1)
@@ -432,6 +434,8 @@ func (s *levelsController) levelTargets() targets {
 	return t
 }
 
+// 长跑的多个 goroutine.
+// TODO(mwish): 该看了.
 func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 	defer lc.Done()
 
@@ -639,6 +643,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 	// Pick a discard ts, so we can discard versions below this ts. We should
 	// never discard any versions starting from above this timestamp, because
 	// that would affect the snapshot view guarantee provided by transactions.
+	//
+	// 关于 discard 版本的逻辑
 	discardTs := s.kv.orc.discardAtOrBelow()
 
 	// Try to collect stats so that we can inform value log about GC. That would help us find which
@@ -890,7 +896,7 @@ func (s *levelsController) compactBuildTables(
 			valid = append(valid, table)
 		}
 	}
-
+	// 构建 iter 的方法.
 	newIterator := func() []y.Iterator {
 		// Create iterators across all the tables involved first.
 		var iters []y.Iterator
@@ -1037,7 +1043,9 @@ type compactDef struct {
 	thisLevel   *levelHandler
 	nextLevel   *levelHandler
 
+	// top
 	top []*table.Table
+	// bottom
 	bot []*table.Table
 
 	thisRange keyRange
@@ -1415,7 +1423,8 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 
 	// Table should never be moved directly between levels, always be rewritten to allow discarding
 	// invalid versions.
-
+	//
+	// 构建 table, 比较重要的部分.
 	newTables, decr, err := s.compactBuildTables(l, cd)
 	if err != nil {
 		return err
@@ -1480,6 +1489,8 @@ func tablesToString(tables []*table.Table) []string {
 var errFillTables = errors.New("Unable to fill tables")
 
 // doCompact picks some table on level l and compacts it away to the next level.
+//
+// 压缩外部调用的地方, 这里是个多线程的处理.
 func (s *levelsController) doCompact(id int, p compactionPriority) error {
 	l := p.level
 	y.AssertTrue(l < s.kv.opt.MaxLevels) // Sanity check.
@@ -1538,7 +1549,7 @@ func (s *levelsController) addLevel0Table(t *table.Table) error {
 		// the proper order. (That means this update happens before that of some compaction which
 		// deletes the table.)
 		err := s.kv.manifest.addChanges([]*pb.ManifestChange{
-			newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
+			newCreateChange(t.ID(), /* level */ 0, t.KeyID(), t.CompressionType()),
 		})
 		if err != nil {
 			return err
@@ -1548,6 +1559,7 @@ func (s *levelsController) addLevel0Table(t *table.Table) error {
 	for !s.levels[0].tryAddLevel0Table(t) {
 		// Before we unstall, we need to make sure that level 0 is healthy.
 		timeStart := time.Now()
+		// 这里有 stall 啊, 发现 Level0 超过之后睡 10ms.
 		for s.levels[0].numTables() >= s.kv.opt.NumLevelZeroTablesStall {
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -1579,6 +1591,8 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 	// read level L's tables post-compaction and level L+1's tables pre-compaction. (If we do
 	// parallelize this, we will need to call the h.RLock() function by increasing order of level
 	// number.)
+	//
+	// 需要从高度到低, 因为这个 get 没有拿到一把大锁, 合并可能漏过需要的.( 话说我感觉这个地方是不是会死锁, 然后从上到下做死锁避免).
 	version := y.ParseTs(key)
 	for _, h := range s.levels {
 		// Ignore all levels below startLevel. This is useful for GC when L0 is kept in memory.
@@ -1592,6 +1606,7 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 		if vs.Value == nil && vs.Meta == 0 {
 			continue
 		}
+		// 要么读到匹配的 ts, 要么读到最接近的版本.
 		if vs.Version == version {
 			return vs, nil
 		}

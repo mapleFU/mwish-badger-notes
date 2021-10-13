@@ -463,6 +463,7 @@ type valueLog struct {
 	opt               Options
 
 	garbageCh    chan struct{}
+	// vLog 的 discard 信息统计.
 	discardStats *discardStats
 }
 
@@ -1052,6 +1053,7 @@ LOOP:
 	// This file was deleted but it's discard stats increased because of compactions. The file
 	// doesn't exist so we don't need to do anything. Skip it and retry.
 	if !ok {
+		// discardStats 是统计出来的.
 		vlog.discardStats.Update(fid, -1)
 		goto LOOP
 	}
