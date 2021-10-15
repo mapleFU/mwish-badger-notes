@@ -113,10 +113,13 @@ type DB struct {
 	lc        *levelsController
 	vlog      valueLog
 	writeCh   chan *request
+	// flushChan 保证正在 flush 的 memtable 不超过 db.opt.NumMemtables
 	flushChan chan flushTask // For flushing memtables.
 	closeOnce sync.Once      // For closing DB only once.
 
+	// 这里表面上是一个 i32, 实际上是个 0/1 状态机. 表示是否有正在进行的 blockingWrite.
 	blockWrites int32
+	// 我真的操了, 为啥前面 i32 后面 u32, 你麻痹没有 atomic_bool ?
 	isClosed    uint32
 
 	orc              *oracle
@@ -762,13 +765,18 @@ var requestPool = sync.Pool{
 	},
 }
 
+// writeToLSM 的单位是 request. 这点本身没什么问题, 但是这里会 SyncWAL, 感觉有点怪
+// 感觉有点好处就是 db.lock 的粒度比较小.
+// TODO(mwish): 为什么这里要 sync WAL 呢?
+// A: 我个人感觉上是为了不影响前台 mt 的读.
 func (db *DB) writeToLSM(b *request) error {
-	// TODO(mwish): 这个 lock 保护了什么..?
+	// 这个 lock 保护了 db.mt, 让 db.mt 是一写多读的.
 	db.lock.RLock()
 	defer db.lock.RUnlock()
 	for i, entry := range b.Entries {
 		var err error
 		if db.opt.managedTxns || entry.skipVlogAndSetThreshold(db.valueThreshold()) {
+			// Note: badger 比较迷惑的一点就是, mt 包含 wal.
 			// Will include deletion / tombstone case.
 			err = db.mt.Put(entry.Key,
 				y.ValueStruct{
@@ -797,6 +805,7 @@ func (db *DB) writeToLSM(b *request) error {
 	}
 	// Q: WAL 和 vLog 有什么区别? 为什么都在 mt 上?
 	// A: 这里面有一些小 key-value, 会不落 vLog, 直接写到 LSM + MT 上.
+	// (去网上瞅了眼, 好像工业界没有人用直接全写 vLog 的优化).
 	if db.opt.SyncWrites {
 		return db.mt.SyncWAL()
 	}
@@ -817,8 +826,8 @@ func (db *DB) writeRequests(reqs []*request) error {
 		}
 	}
 	db.opt.Debugf("writeRequests called. Writing to value log")
-	// 先写 vLog, 写的对象是 requests
-	// 然后比较有意思的是, vLog 写成功然后后续失败感觉也没啥关系.
+	// 先写 vLog, 写的对象是 requests (其实这里还挺容易混淆的)
+	// 然后比较有意思的是, vLog 写成功然后后续失败感觉也没啥关系, 这里也没有什么 write stall.
 	err := db.vlog.write(reqs)
 	if err != nil {
 		done(err)
@@ -833,6 +842,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 	// 串行写 memtable:
 	// 1. 确保空间足够. 这里比较有意思的是, 没有 WriteStall 降速.
 	// 2. writeToLSM 来写具体内容.
+	// 3. 写入的时候(包括写 vLog + mem+wal) 都是独立串行的.
 	for _, b := range reqs {
 		if len(b.Entries) == 0 {
 			continue
@@ -841,6 +851,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 		var i uint64
 		var err error
 
+		// 如果没有空间, 就一直睡 10ms 睡死在这里.
 		for err = db.ensureRoomForWrite(); err == errNoRoom; err = db.ensureRoomForWrite() {
 			i++
 			if i%100 == 0 {
@@ -855,7 +866,7 @@ func (db *DB) writeRequests(reqs []*request) error {
 			done(err)
 			return y.Wrap(err, "writeRequests")
 		}
-		// 具体写入的接口
+		// 具体写入的接口, 写 wal + mem
 		if err := db.writeToLSM(b); err != nil {
 			done(err)
 			return y.Wrap(err, "writeRequests")
@@ -867,9 +878,11 @@ func (db *DB) writeRequests(reqs []*request) error {
 }
 
 func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
+	// 检查没有正在进行的 blockWrite
 	if atomic.LoadInt32(&db.blockWrites) == 1 {
 		return nil, ErrBlockedWrites
 	}
+	// 检查事务是否过大 (我很好奇为什么他麻痹要在这检查).
 	var count, size int64
 	for _, e := range entries {
 		size += e.estimateSizeAndSetThreshold(db.valueThreshold())
@@ -882,7 +895,7 @@ func (db *DB) sendToWriteCh(entries []*Entry) (*request, error) {
 	// We can only service one request because we need each txn to be stored in a contigous section.
 	// Txns should not interleave among other txns or rewrites.
 	//
-	// 这里从池子里拿, req 是需要同步的. 这里也通过 wg 来同步.
+	// 这里从池子里拿, req 是需要同步的. 这里也通过 wg 来同步. 然后保证放进去的一定是没有东西等着的.
 	req := requestPool.Get().(*request)
 	req.reset()
 	req.Entries = entries
@@ -910,6 +923,7 @@ func (db *DB) doWrites(lc *z.Closer) {
 		if err := db.writeRequests(reqs); err != nil {
 			db.opt.Errorf("writeRequests: %v", err)
 		}
+		// 写完之后写入 pendingCh.
 		<-pendingCh
 	}
 
@@ -1005,12 +1019,15 @@ var errNoRoom = errors.New("No room for write")
 
 // ensureRoomForWrite is always called serially.
 //
-// TODO(mwish): lock 这里会保护什么?
+// Note(mwish): lock 这里会保护什么?
+// A: 对 db.mt 的操作, 这里会访问 db.mt, 有必要的时候会把内容切走.
 // 1. memtable not full, return
 // 2. 如果 flushChan 无法立刻 send, 表示 pending memtable 到达上界, 返回 no mem, 否则变成 immutable 的, 丢给
 //  db.flushChan
 //
-// 然后比较有趣的一点是, ensureRoomForWrite 这里只实现了 err, 没有实现 Write Stall. 为什么呢? 感觉这里是认为写入瓶颈不会走到 Compaction 这里, 而是走到 vLog 上?
+// 然后比较有趣的一点是, ensureRoomForWrite 这里只实现了 err, 没有实现 WriteStall. 为什么呢?
+// 感觉这里是认为写入瓶颈不会走到 Compaction 这里, 而是走到 vLog 上? (如果都是小 kv, 感觉会失去 Write Stall 的能力, 不过反之要整合)
+// (WriteStall 可以主动让写入降速, 减少上游写入, 但是有让上游没有反馈的情况下, 写入堆积的风险).
 func (db *DB) ensureRoomForWrite() error {
 	var err error
 	db.lock.Lock()
@@ -1021,6 +1038,9 @@ func (db *DB) ensureRoomForWrite() error {
 		return nil
 	}
 
+	// non-blocking.
+	// if memtable becomes full, trying to send to flushChan.
+	// (不过这个地方很好玩, 这个地方不应该是写满之后送进去吗...而是要下次写入来 trigger).
 	select {
 	case db.flushChan <- flushTask{mt: db.mt}:
 		db.opt.Debugf("Flushing memtable, mt.size=%d size of flushChan: %d\n",
@@ -1104,13 +1124,29 @@ func (db *DB) NewSkiplist() *skl.Skiplist {
 	return skl.NewSkiplist(arenaSize(db.opt))
 }
 
+// 具体的 flushTask, 这里 send 进来的时候, 只能带 mt 和可选的 cb.
+// 在后续使用的时候 (`handleFlushTask` 之前), 会构建出一个 itr 作为 Merging Iterator.
+// 说实话, 我认为这个抽象做的 非 常 垃 圾.
+type flushTask struct {
+	// immutable memtable
+	// 这里在 sending channel 的时候 绝不可能是 null
+	mt *memTable
+	// TODO(mwish): 这个会挂什么类型的 func 呢?
+	cb func()
+	// 这里是一个 merging iterator
+	itr y.Iterator
+	// TODO(mwish): 这里会挂什么呢？
+	dropPrefixes [][]byte
+}
+
 // buildL0Table builds a new table from the memtable.
 func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
 	var iter y.Iterator
 	if ft.itr != nil {
 		iter = ft.itr
 	} else {
-		// 这是什么几把抽象泄露...
+		// 这是什么几把抽象泄露...原本应该外部 build iter 吧...
+		// (虽然这应该是区分单个 iter 的情况，但是我觉得真的傻逼).
 		iter = ft.mt.sl.NewUniIterator(false)
 	}
 	defer iter.Close()
@@ -1128,18 +1164,6 @@ func buildL0Table(ft flushTask, bopts table.Options) *table.Builder {
 		b.Add(iter.Key(), iter.Value(), vp.Len)
 	}
 	return b
-}
-
-// 具体的 flushTask
-type flushTask struct {
-	// immutable memtable
-	mt *memTable
-	// TODO(mwish): 这个会挂什么类型的 func 呢?
-	cb func()
-	// 这里是一个 merging iterator
-	itr y.Iterator
-	// TODO(mwish): 这里会挂什么呢？
-	dropPrefixes [][]byte
 }
 
 // handleFlushTask must be run serially.
@@ -1164,12 +1188,14 @@ func (db *DB) handleFlushTask(ft flushTask) error {
 		data := builder.Finish()
 		tbl, err = table.OpenInMemoryTable(data, fileID, &bopts)
 	} else {
+		// 让 builder 输出对应的文件名, 然后输出到 sst 文件中
 		tbl, err = table.CreateTable(table.NewFilename(fileID, db.opt.Dir), builder)
 	}
 	if err != nil {
 		return y.Wrap(err, "error while creating table")
 	}
 	// We own a ref on tbl.
+	// flush 的时候, 触发 LevelController 的 flush.
 	err = db.lc.addLevel0Table(tbl) // This will incrRef
 	_ = tbl.DecrRef()               // Releases our ref.
 	return err
@@ -1183,9 +1209,12 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 	defer lc.Done()
 
 	var sz int64
+	// 下面这三个玩意, 每个都有 sz 个, 是 send 来的
 	var itrs []y.Iterator
 	var mts []*memTable
 	var cbs []func()
+	// slurp 函数把积存的 memtable 全都读掉, 然后构建一整个迭代器.
+	// 注意, 这里比较好玩, flushChan 的成员是 flushTask, 这里特比好玩的只接收了 flushTask 的 cb 和 mt.
 	slurp := func() {
 		for {
 			select {
@@ -1226,6 +1255,7 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 
 		// db.opt.Infof("Picked %d memtables. Size: %d\n", len(itrs), sz)
 		ft.mt = nil
+		// 这里构建了一个 Merging iterator.
 		ft.itr = table.NewMergeIterator(itrs, false)
 		ft.cb = nil
 
@@ -1234,6 +1264,8 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 			if err == nil {
 				// Update s.imm. Need a lock.
 				db.lock.Lock()
+				// 这里应该需要保证刷过来的 mt 都是顺序的.
+				//
 				// This is a single-threaded operation. ft.mt corresponds to the head of
 				// db.imm list. Once we flush it, we advance db.imm. The next ft.mt
 				// which would arrive here would match db.imm[0], because we acquire a
@@ -1242,6 +1274,7 @@ func (db *DB) flushMemtable(lc *z.Closer) error {
 				for _, mt := range mts {
 					y.AssertTrue(mt == db.imm[0])
 					db.imm = db.imm[1:]
+					// 单个 mt 来 Dec
 					mt.DecrRef() // Return memory.
 				}
 				db.lock.Unlock()
@@ -1693,6 +1726,8 @@ func (db *DB) startMemoryFlush() {
 // levels, which is necessary after a restore from backup. During Flatten, live compactions are
 // stopped. Ideally, no writes are going on during Flatten. Otherwise, it would create competition
 // between flattening the tree and new tables being created at level zero.
+//
+// 这里是 LSMTree 的 C
 func (db *DB) Flatten(workers int) error {
 
 	db.stopCompactions()
@@ -1761,6 +1796,7 @@ func (db *DB) Flatten(workers int) error {
 	}
 }
 
+// 阻塞写入, 一旦有的话会设置 db.blockWrites, 阻止其他的写.
 func (db *DB) blockWrite() error {
 	// Stop accepting new writes.
 	if !atomic.CompareAndSwapInt32(&db.blockWrites, 0, 1) {
@@ -1985,6 +2021,8 @@ func (db *DB) DropPrefixNonBlocking(prefixes ...[]byte) error {
 // DropPrefix would drop all the keys with the provided prefix. Based on DB options, it either drops
 // the prefixes by blocking the writes or doing a logical drop.
 // See DropPrefixBlocking and DropPrefixNonBlocking for more information.
+//
+// 删除掉所有有 prefixes 的逻辑
 func (db *DB) DropPrefix(prefixes ...[]byte) error {
 	if db.opt.AllowStopTheWorld {
 		return db.DropPrefixBlocking(prefixes...)

@@ -42,6 +42,7 @@ type oracle struct {
 	nextTxnTs   uint64
 
 	// Used to block NewTransaction, so all previous commits are visible to a new read.
+	// 写的水位，比读的水位高
 	txnMark *y.WaterMark
 
 	// Either of these is used to determine which versions can be permanently
@@ -132,6 +133,7 @@ func (o *oracle) setDiscardTs(ts uint64) {
 	o.cleanupCommittedTransactions()
 }
 
+// 返回读的低水位, 小于这个的数据可以被 GC(discard) 掉.
 func (o *oracle) discardAtOrBelow() uint64 {
 	if o.isManaged {
 		o.Lock()
@@ -142,6 +144,9 @@ func (o *oracle) discardAtOrBelow() uint64 {
 }
 
 // hasConflict must be called while having a lock.
+// 比较有意思的是, hasConflict 这里面不会检查 `detectConflict` 这个 flag, 这里
+// 只检查来的事务的 writeSet 是否与 `o.committedTxns` 的 (txn.readTs, ...] 间的 write
+// 有冲突。之所以 txn.readTs 是开区间原因很简单，想想就是了.
 func (o *oracle) hasConflict(txn *Txn) bool {
 	// 如果一个读写事务什么都没读, 那么肯定没有 conflict.
 	// 这里在 `txn.addReadKey` 的时候会添加. 纯 Set 的事务反而不会添加这个?
@@ -182,13 +187,19 @@ func (o *oracle) newCommitTs(txn *Txn) (uint64, bool) {
 
 	var ts uint64
 	if !o.isManaged {
-		// TODO(mwish): 为什么要在这里 DoneRead?
+		// Q: 为什么要在这里 DoneRead? 而不是在写事务确定可以提交的时候?
+		// A: 我们这个地方要考虑合法性和必要性.
+		// 1. 合法性: 之后不会再添加新的读, 因为这里上了锁, 所以外部也不会看到 readTs 和 writeTs 水位的不一致.
+		//    也就是说, newCommitTs 之后, 这里不再会有新的读. 把这些记录 gc 掉, 也是没有关系的(这里最终影响的是纪录的 gc).
+		// 2. 如果在 commit 或者 abort 的时候处理, 那么纪录可能被延迟 gc.
 		o.doneRead(txn)
 		o.cleanupCommittedTransactions()
 
 		// This is the general case, when user doesn't specify the read and commit ts.
 		ts = o.nextTxnTs
 		o.nextTxnTs++
+		// 推高 txnMark, 这个在 readTs 的时候有用.
+		// 因为获取一个 readTs 的时候, 需要上面所有的写入都结束了.
 		o.txnMark.Begin(ts)
 
 	} else {
@@ -230,6 +241,7 @@ func (o *oracle) cleanupCommittedTransactions() { // Must be called under o.Lock
 	if o.isManaged {
 		maxReadTs = o.discardTs
 	} else {
+		// 拿到 readMark 的低水位.
 		maxReadTs = o.readMark.DoneUntil()
 	}
 
@@ -405,7 +417,8 @@ func ValidEntry(db *DB, key, val []byte) error {
 
 // 根据 txn 的 flag 来处理 `Entry`, 这里有两个部分:
 // 1. 根据 txn 的信息, 和 key, value 来检查 Entry 的 kv 是否合法.
-// 2.
+// 2. 如果要检测冲突冲突，把 Key 注册到 conflictKeys 中
+// 3. 把写入注册到 pendingWrites 中, 返回
 func (txn *Txn) modify(e *Entry) error {
 	switch {
 	case !txn.update:
@@ -440,7 +453,7 @@ func (txn *Txn) modify(e *Entry) error {
 		fp := z.MemHash(e.Key) // Avoid dealing with byte arrays.
 		txn.conflictKeys[fp] = struct{}{}
 	}
-	// TODO(mwish): 不懂 manage mode 了. 感觉大概意思是, 外部处理 txn-ts 的时候的逻辑?
+	// TODO(mwish): 不懂 manage mode 了. 感觉大概意思是, 外部处理 txn-ts 的时候的逻辑? 这里不想看 manage mode 有关的信息了.
 	//
 	// If a duplicate entry was inserted in managed mode, move it to the duplicate writes slice.
 	// Add the entry to duplicateWrites only if both the entries have different versions. For
@@ -651,7 +664,7 @@ func (txn *Txn) commitAndSend() (func() error, error) {
 	if keepTogether {
 		// CommitTs should not be zero if we're inserting transaction markers.
 		y.AssertTrue(commitTs != 0)
-		// 给事务设置一个边界.
+		// 给事务设置一个边界, 然后添加这个边界 entry.
 		e := &Entry{
 			Key:   y.KeyWithTs(txnKey, commitTs),
 			Value: []byte(strconv.FormatUint(commitTs, 10)),
@@ -691,7 +704,7 @@ func (txn *Txn) commitPrecheck() error {
 		}
 	}
 
-	// TODO(mwish): managedTxns 是什么 jb 逻辑啊...
+	// managedTxns 是外部管理 txn 的逻辑，不想管了
 	//
 	// If keepTogether is True, it implies transaction markers will be added.
 	// In that case, commitTs should not be never be zero. This might happen if
@@ -738,6 +751,7 @@ func (txn *Txn) Commit() error {
 	}
 	defer txn.Discard()
 
+	// 发送到 LSMTree 和 memtable, 来执行写.
 	txnCb, err := txn.commitAndSend()
 	if err != nil {
 		return err

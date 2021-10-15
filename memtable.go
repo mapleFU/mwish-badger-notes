@@ -50,6 +50,7 @@ type memTable struct {
 	sl *skl.Skiplist
 	// 这里还是有一份 wal.
 	wal        *logFile
+	// 写入锅的最大版本
 	maxVersion uint64
 	opt        Options
 	buf        *bytes.Buffer
@@ -186,6 +187,7 @@ func (mt *memTable) isFull() bool {
 }
 
 func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
+	// 外面 Entry -> ValueStruct, 你这又转回去了? 你妈的?
 	entry := &Entry{
 		Key:       key,
 		Value:     value.Value,
@@ -205,6 +207,7 @@ func (mt *memTable) Put(key []byte, value y.ValueStruct) error {
 		}
 	}
 	// We insert the finish marker in the WAL but not in the memtable.
+	// FinTxn 不会写到 MT 里面. TODO(mwish): 比较好奇读取的时候或者 Compaction 的时候会怎么处理.
 	if entry.meta&bitFinTxn > 0 {
 		return nil
 	}
@@ -294,13 +297,16 @@ func (lf *logFile) Truncate(end int64) error {
 	return lf.MmapFile.Truncate(end)
 }
 
-// 具体内容都会写到 Buf 中. 返回 length.
+// 具体内容都会写到 Buf 中. 返回 length. 这个地方 tee 了一个输出流到 CRC, 然后用这个 tee 的结果
+// 来写 CRC.
 //
 // encodeEntry will encode entry to the buf
 // layout of entry
 // +--------+-----+-------+-------+
 // | header | key | value | crc32 |
 // +--------+-----+-------+-------+
+//
+// Header 定义在 structs.go 中, header 已经有 key, value 的长度了, 所以这些都可以直接推导出来.
 func (lf *logFile) encodeEntry(buf *bytes.Buffer, e *Entry, offset uint32) (int, error) {
 	h := header{
 		klen:      uint32(len(e.Key)),

@@ -173,6 +173,8 @@ func (r *safeRead) Entry(reader io.Reader) (*Entry, error) {
 	return e, nil
 }
 
+// gc 的流程. 这里会用 `vlog.db.batchSet` 回写db.
+// 这不会再单独写 vLog 文件.
 func (vlog *valueLog) rewrite(f *logFile) error {
 	vlog.filesLock.RLock()
 	for _, fid := range vlog.filesToBeDeleted {
@@ -463,6 +465,7 @@ type valueLog struct {
 	opt               Options
 
 	garbageCh    chan struct{}
+	// vLog 的 discard 信息统计.
 	discardStats *discardStats
 }
 
@@ -764,7 +767,8 @@ func (vlog *valueLog) woffset() uint32 {
 // 1. maxVlogFileSize: vLog file 的大小不能超过 u32 的索引.
 // 2. 单个文件的 softlimit: vlog.opt.ValueLogFileSize.
 //
-// TODO(mwish): 这里应该是要求不超过, 不过来两个 2GB 多一点的, 不是绷不住了??? 能不能提一个 issue?
+// Q: 这里应该是要求不超过, 不过来两个 2GB 多一点的, 不是绷不住了??? 能不能提一个 issue?
+// A: 感觉默认情况下是不用的, 限制是 4G, 但是 `ValueLogFileSize` 默认是 1G, 感觉这里就没太所谓了.
 func (vlog *valueLog) validateWrites(reqs []*request) error {
 	vlogOffset := uint64(vlog.woffset())
 	for _, req := range reqs {
@@ -798,6 +802,12 @@ func estimateRequestSize(req *request) uint64 {
 }
 
 // valueLog.write 只会被 db 单线程写. 如果是 sync 写入模式, 在结束之前一定会调用 `sync`.
+// 需要注意的是, 这个地方的参数是 `[]*request`.
+//
+// vLog 用 mmap 读写, 写完之后 msync. 如果文件开的大小不够, 用 ftruncate 来映射. 因为这里不会从 vLog 中恢复,
+// 所以 vLog 多大就多大.
+//
+// 这里面会短暂上 `valueLog.filesLock`, 外部应该会保证 valueLog 只有一个 writer.
 //
 // write is thread-unsafe by design and should not be called concurrently.
 func (vlog *valueLog) write(reqs []*request) error {
@@ -842,7 +852,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		}
 
 		start := int(endOffset - n)
-		// copy 到 mmap 管理的文件中
+		// copy 到 mmap 管理的 vLog 文件中.
 		y.AssertTrue(copy(curlf.Data[start:], buf.Bytes()) == int(n))
 
 		atomic.StoreUint32(&curlf.size, endOffset)
@@ -865,12 +875,13 @@ func (vlog *valueLog) write(reqs []*request) error {
 		return nil
 	}
 
+	// 具体把每个 request 的内容加入 buffer. 以二进制的形式准备丢到 vLog 中.
 	buf := new(bytes.Buffer)
 	// 对每个 requests (每个可能包含一个 txn).
 	for i := range reqs {
 		b := reqs[i]
 		// clear ptrs.
-		// ptr 指向对应的文件内容, 如果 Ptrs 是默认值, 代表它存储的内容 inline 了.
+		// <del>ptr 指向对应的文件内容, 如果 Ptrs 是默认值, 代表它存储的内容 inline 了.</del>
 		b.Ptrs = b.Ptrs[:0]
 		var written, bytesWritten int
 		valueSizes := make([]int64, 0, len(b.Entries))
@@ -880,8 +891,9 @@ func (vlog *valueLog) write(reqs []*request) error {
 			e := b.Entries[j]
 			// value append 到 buf 中.
 			valueSizes = append(valueSizes, int64(len(e.Value)))
-			// 如果数据是 inline 的 ( 小于 vlog.db.valueThreshold() )
+			// 如果数据是 inline 的 ( 小于 vlog.db.valueThreshold(), 默认 1MB )
 			// 就不写 vLog, 这里添加一个空的 valuePointer, Go 这个 ptr 是有默认值的=。=
+			// 然后跳过写 vLog 的流程.
 			if e.skipVlogAndSetThreshold(vlog.db.valueThreshold()) {
 				b.Ptrs = append(b.Ptrs, valuePointer{})
 				continue
@@ -891,7 +903,8 @@ func (vlog *valueLog) write(reqs []*request) error {
 			p.Fid = curlf.fid
 			p.Offset = vlog.woffset()
 
-			// vLog 去掉 txn 相关的 mark.
+			// vLog 去掉 txn 相关的 mark. 这里是说, 存储的时候写 txn 标记是没有意义的, 因为 GC vLog 不会考虑
+			// 半毛钱和这个有关的逻辑, 但是前台还需要这个.
 			//
 			// We should not store transaction marks in the vlog file because it will never have all
 			// the entries in a transaction. If we store entries with transaction marks then value
@@ -900,7 +913,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 			// in a temporary variable and reassign it after writing to the value log.
 			tmpMeta := e.meta
 			e.meta = e.meta &^ (bitTxn | bitFinTxn)
-			// Note: 下面的函数介绍了如何编码 Entry
+			// Note: 下面的函数介绍了如何编码 Entry, e 的 key/value 是
 			plen, err := curlf.encodeEntry(buf, e, p.Offset) // Now encode the entry into buffer.
 			if err != nil {
 				return err
@@ -909,6 +922,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 			e.meta = tmpMeta
 
 			p.Len = uint32(plen)
+			// 添加到 Ptrs 中, Ptrs 不会写到存储里面.
 			b.Ptrs = append(b.Ptrs, p)
 			// 调用 write 写 vLog 文件.
 			if err := write(buf); err != nil {
@@ -921,6 +935,7 @@ func (vlog *valueLog) write(reqs []*request) error {
 		y.NumWritesAdd(vlog.opt.MetricsEnabled, int64(written))
 		y.NumBytesWrittenAdd(vlog.opt.MetricsEnabled, int64(bytesWritten))
 
+		// 更新一些统计信息, 然后 mmap 写盘.
 		vlog.numEntriesWritten += uint32(written)
 		vlog.db.threshold.update(valueSizes)
 		// We write to disk here so that all entries that are part of the same transaction are
@@ -1040,6 +1055,7 @@ LOOP:
 	// This file was deleted but it's discard stats increased because of compactions. The file
 	// doesn't exist so we don't need to do anything. Skip it and retry.
 	if !ok {
+		// discardStats 是统计出来的.
 		vlog.discardStats.Update(fid, -1)
 		goto LOOP
 	}
@@ -1067,6 +1083,7 @@ LOOP:
 }
 
 func discardEntry(e Entry, vs y.ValueStruct, db *DB) bool {
+	// 这个 version 没了(存在的话会很准的拿到).
 	if vs.Version != y.ParseTs(e.Key) {
 		// Version not found. Discard.
 		return true

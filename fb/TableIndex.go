@@ -6,6 +6,7 @@ import (
 	flatbuffers "github.com/google/flatbuffers/go"
 )
 
+// 这块东西是用 flat buffer 做的.
 type TableIndex struct {
 	_tab flatbuffers.Table
 }

@@ -45,6 +45,8 @@ const (
 	padding = 256
 )
 
+// header 应该是单条记录的 header. 合起来是 4bytes.
+// 这两部分都是针对 key 的,
 type header struct {
 	overlap uint16 // Overlap with base key.
 	diff    uint16 // Length of the diff.
@@ -70,15 +72,18 @@ func (h *header) Decode(buf []byte) {
 // bblock represents a block that is being compressed/encrypted in the background.
 type bblock struct {
 	data         []byte
+	// baseKey 只会在初始化的时候赋予一个.
 	baseKey      []byte   // Base key for the current block.
 	entryOffsets []uint32 // Offsets of entries present in current block.
+	// 目前写入的终点.
 	end          int      // Points to the end offset of the block.
 }
 
 // Builder is used in building a table.
 type Builder struct {
 	// Typically tens or hundreds of meg. This is for one single file.
-	alloc            *z.Allocator
+	alloc            *z.Allocator // allocator 应该是一个语义化的 buffer.
+	// 这里 block 应该不会直接写下去? 这里是正在处理的 block 的内容.
 	curBlock         *bblock
 	compressedSize   uint32
 	uncompressedSize uint32
@@ -94,9 +99,12 @@ type Builder struct {
 	// Used to concurrently compress/encrypt blocks.
 	wg        sync.WaitGroup
 	blockChan chan *bblock
+	// 这个地方是 ready to flush 的 block 的列表。
 	blockList []*bblock
 }
 
+// 返回 data 段长度为 `need` 的数据, 之前的返回可能会失效.
+// 这个函数比较有意思的是, 返回的是 current block 的内容, 而且进行的是内存操作.
 func (b *Builder) allocate(need int) []byte {
 	bb := b.curBlock
 	if len(bb.data[bb.end:]) < need {
@@ -133,6 +141,7 @@ func NewTableBuilder(opts Options) *Builder {
 	}
 	b.alloc.Tag = "Builder"
 	b.curBlock = &bblock{
+		// 构建 BlockSize + padding 的内存.
 		data: b.alloc.Allocate(opts.BlockSize + padding),
 	}
 	b.opts.tableCapacity = uint64(float64(b.opts.TableSize) * 0.95)
@@ -142,7 +151,7 @@ func NewTableBuilder(opts Options) *Builder {
 	if b.opts.Compression == options.None && b.opts.DataKey == nil {
 		return b
 	}
-
+	// numCPU * 2 的 channel 来做写入...
 	count := 2 * runtime.NumCPU()
 	b.blockChan = make(chan *bblock, count*2)
 
@@ -163,11 +172,13 @@ func maxEncodedLen(ctype options.CompressionType, sz int) int {
 	return sz
 }
 
+// 加密/压缩.
 func (b *Builder) handleBlock() {
 	defer b.wg.Done()
 
 	doCompress := b.opts.Compression != options.None
 	for item := range b.blockChan {
+		// 拿到对应的 buf.
 		// Extract the block.
 		blockBuf := item.data[:item.end]
 		// Compress the block.
@@ -219,14 +230,20 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct, vpLen uint32) {
 	b.keyHashes = append(b.keyHashes, y.Hash(y.ParseKey(key)))
 
 	if version := y.ParseTs(key); version > b.maxVersion {
+		// 推高 maxVersion.
 		b.maxVersion = version
 	}
 
 	// diffKey stores the difference of key with baseKey.
+	// 这里存储的是和上次不同的内容.
+	// 1. 之前没有, 就是 key[0], 然后把内容注册到 block.baseKey 里面
+	// 2. 否则就是 key[1] 和 key[0] 的差距, 这里好像不会有什么 restart 长度之类的.
 	var diffKey []byte
 	if len(b.curBlock.baseKey) == 0 {
 		// Make a copy. Builder should not keep references. Otherwise, caller has to be very careful
 		// and will have to make copies of keys every time they add to builder, which is even worse.
+		//
+		// 更新 baseKey (为什么 baseKey 就一个? 可能是为了实现方便? 每次只要读第一个 key 就行?)
 		b.curBlock.baseKey = append(b.curBlock.baseKey[:0], key...)
 		diffKey = key
 	} else {
@@ -253,6 +270,8 @@ func (b *Builder) addHelper(key []byte, v y.ValueStruct, vpLen uint32) {
 
 	// Add the vpLen to the onDisk size. We'll add the size of the block to
 	// onDisk size in Finish() function.
+	//
+	// 写入具体的 vpLen.
 	b.onDiskSize += vpLen
 }
 
@@ -282,6 +301,7 @@ func (b *Builder) finishBlock() {
 	b.append(checksum)
 	b.append(y.U32ToBytes(uint32(len(checksum))))
 
+	// 添加到处理完的 block 的列表, 这个地方是单线程的.
 	b.blockList = append(b.blockList, b.curBlock)
 	atomic.AddUint32(&b.uncompressedSize, uint32(b.curBlock.end))
 
@@ -295,12 +315,22 @@ func (b *Builder) finishBlock() {
 	b.lenOffsets += uint32(int(math.Ceil(float64(len(b.curBlock.baseKey))/4))*4) + 40
 
 	// If compression/encryption is enabled, we need to send the block to the blockChan.
+	// TODO(mwish): 我怎么看这个地方 blockChan 都不会是 nil.
 	if b.blockChan != nil {
 		b.blockChan <- b.curBlock
 	}
 	return
 }
 
+// 这里是文件大小超过限制. 这个函数的语义是 "加上 value 之后会不会超", 如果会超的话,
+// 那么会在写入这条记录之前刷下去.
+// (这里应该 record 都不会很大, 大的都会刷到 value log 里面的)
+//
+// 这里的限制是 `b.opts.BlockSize`.
+// 格式估算可以看 `FinishBlock` 函数, 介绍了对应的格式, 这里分为:
+// 1. entriesOffsetsSize 这里实际上包括 meta 的内容, offsets size: 4byte 的长度,
+//   8byte 的 checksum + 4byte length.
+// 2. 对 key 和 value 大小, value 是 `y.ValueStruct`.
 func (b *Builder) shouldFinishBlock(key []byte, value y.ValueStruct) bool {
 	// If there is no entry till now, we will return false.
 	if len(b.curBlock.entryOffsets) <= 0 {
@@ -338,6 +368,7 @@ func (b *Builder) AddStaleKey(key []byte, v y.ValueStruct, valueLen uint32) {
 	b.addInternal(key, v, valueLen, true)
 }
 
+// 添加逻辑.
 // Add adds a key-value pair to the block.
 func (b *Builder) Add(key []byte, value y.ValueStruct, valueLen uint32) {
 	b.addInternal(key, value, valueLen, false)
@@ -407,6 +438,7 @@ func (b *Builder) Finish() []byte {
 
 type buildData struct {
 	blockList []*bblock
+	// flatbuffer 构建的 index 段.
 	index     []byte
 	checksum  []byte
 	Size      int
@@ -426,8 +458,10 @@ func (bd *buildData) Copy(dst []byte) int {
 	return written
 }
 
+// Block Builder 要写入内容
 func (b *Builder) Done() buildData {
 	b.finishBlock() // This will never start a new block.
+	// TODO(mwish): 我怎么看这个地方 blockChan 都不会是 nil.
 	if b.blockChan != nil {
 		close(b.blockChan)
 	}
@@ -442,11 +476,17 @@ func (b *Builder) Done() buildData {
 		alloc:     b.alloc,
 	}
 
+	// 构建一个 filter 对象, 然后 buildIndex
 	var f y.Filter
 	if b.opts.BloomFalsePositive > 0 {
 		bits := y.BloomBitsPerKey(len(b.keyHashes), b.opts.BloomFalsePositive)
 		f = y.NewFilter(b.keyHashes, bits)
 	}
+	// flatbuffer 构建 index 段.
+	// 包含:
+	// 1. bloom filter.
+	// 2. blocks 偏移量
+	// 3. key 最大最小
 	index, dataSize := b.buildIndex(f)
 
 	var err error
@@ -534,6 +574,7 @@ func (b *Builder) compressData(data []byte) ([]byte, error) {
 	return nil, errors.New("Unsupported compression type")
 }
 
+// 这里比较有意思的是, 这个 index 是全局的 index, 构建这个使用 flatbuffer 构建的.
 func (b *Builder) buildIndex(bloom []byte) ([]byte, uint32) {
 	builder := fbs.NewBuilder(3 << 20)
 

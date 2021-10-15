@@ -44,6 +44,8 @@ func newNode() *node {
 }
 
 // Trie datastructure.
+//
+// Trie 感觉被用在 发布/订阅 模块上了。
 type Trie struct {
 	root *node
 }

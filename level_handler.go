@@ -25,10 +25,13 @@ import (
 	"github.com/dgraph-io/badger/v3/y"
 )
 
+// levelHandler 维护了 sst, 对外提供了 get/set 的语义.
+// 这里一层只会有一个 levelHandler.
 type levelHandler struct {
 	// Guards tables, totalSize.
 	sync.RWMutex
 
+	// (看上去就是个 Level Compaction). 维护每一层的信息.
 	// For level >= 1, tables are sorted by key ranges, which do not overlap.
 	// For level 0, tables are sorted by time.
 	// For level 0, newest table are at the back. Compact the oldest one first, which is at the front.
@@ -366,6 +369,8 @@ type levelHandlerRLocked struct{}
 // overlappingTables returns the tables that intersect with key range. Returns a half-interval.
 // This function should already have acquired a read lock, and this is so important the caller must
 // pass an empty parameter declaring such.
+//
+// 这个 key 就简单查一下对给定的 keyrange, 下层 sst 重叠的空间大概是多大.
 func (s *levelHandler) overlappingTables(_ levelHandlerRLocked, kr keyRange) (int, int) {
 	if len(kr.left) == 0 || len(kr.right) == 0 {
 		return 0, 0

@@ -53,7 +53,7 @@ type Options struct {
 	// 写入是否是 sync 的, 应该是约束了 fsync.
 	SyncWrites bool
 	// 需要保持的版本数目.
-	// TODO(mwish): 似乎 badger 有 MVCC, 但我们不知道这个逻辑具体是给谁/做什么的.
+	// discard 的时候会考虑它
 	NumVersionsToKeep int
 	ReadOnly          bool
 	Logger            Logger

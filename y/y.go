@@ -427,6 +427,8 @@ func (b *PageBuffer) Truncate(n int) {
 }
 
 // Bytes returns whole Buffer data as single []byte.
+// 这地方返回的不是 mmap 的内容, 而是 copy 出来的, 这一点比较重要, 因为避免了 mmap 相关的
+// 访问和控制.
 func (b *PageBuffer) Bytes() []byte {
 	buf := make([]byte, b.length)
 	written := 0

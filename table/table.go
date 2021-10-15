@@ -94,8 +94,10 @@ type TableInterface interface {
 }
 
 // Table represents a loaded table file with the info we have about it.
+// TODO(mwish): 这些东西是全部缓存在内存中吗?
 type Table struct {
 	sync.Mutex
+	// table 具体对应的文件, mmap 的内容.
 	*z.MmapFile
 
 	tableSize int // Initialized in OpenTable, using fd.Stat().
@@ -106,6 +108,7 @@ type Table struct {
 
 	// The following are initialized once and const.
 	smallest, biggest []byte // Smallest and largest keys (with timestamps).
+	// 这个 id 是文件有关的 id, 能够标识到文件名.
 	id                uint64 // file id, part of filename
 
 	Checksum       []byte
@@ -186,6 +189,7 @@ func BlockEvictHandler(value interface{}) {
 
 type block struct {
 	offset            int
+	// 这里的 data 应该是 mmap 管理的, 从 Table.Data 里面拿出来的.
 	data              []byte
 	checksum          []byte
 	entriesIndexStart int      // start index of entryOffsets list
@@ -257,6 +261,7 @@ func (b block) verifyCheckSum() error {
 
 func CreateTable(fname string, builder *Builder) (*Table, error) {
 	bd := builder.Done()
+	// newFile 拿到 mmap 文件, 把 builder 的内容拷贝到里面.
 	mf, err := newFile(fname, bd.Size)
 	if err != nil {
 		return nil, err
@@ -489,6 +494,7 @@ func (t *Table) initIndex() (*fb.BlockOffset, error) {
 	}
 	if !t.shouldDecrypt() {
 		// If there's no encryption, this points to the mmap'ed buffer.
+		// 指向 mmap buffer, 用于解锁 index. (从 readTableIndex 读出来的).
 		t._index = index
 	}
 	t._cheap = &cheapIndex{
@@ -558,6 +564,8 @@ func (t *Table) offsets(ko *fb.BlockOffset, i int) bool {
 // block function return a new block. Each block holds a ref and the byte
 // slice stored in the block will be reused when the ref becomes zero. The
 // caller should release the block by calling block.decrRef() on it.
+//
+// useCache 的话, 会使用 `t.opt.BlockCache`.
 func (t *Table) block(idx int, useCache bool) (*block, error) {
 	y.AssertTruef(idx >= 0, "idx=%d", idx)
 	if idx >= t.offsetsLength() {
@@ -586,6 +594,7 @@ func (t *Table) block(idx int, useCache bool) (*block, error) {
 	atomic.AddInt32(&NumBlocks, 1)
 
 	var err error
+	// 这里的 blk.data 不是 mmap 管理的内存.
 	if blk.data, err = t.read(blk.offset, int(ko.Len())); err != nil {
 		return nil, y.Wrapf(err,
 			"failed to read from file: %s at offset: %d, len: %d",
@@ -698,6 +707,8 @@ func (t *Table) Biggest() []byte { return t.biggest }
 func (t *Table) Filename() string { return t.Fd.Name() }
 
 // ID is the table's ID number (used to make the file name).
+//
+//
 func (t *Table) ID() uint64 { return t.id }
 
 // DoesNotHave returns true if and only if the table does not have the key hash.

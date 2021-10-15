@@ -48,6 +48,7 @@ type levelsController struct {
 	levels []*levelHandler
 	kv     *DB
 
+	// 这里应该暗示只能有一个线程在做 Compaction
 	cstatus compactStatus
 }
 
@@ -348,6 +349,7 @@ func (s *levelsController) dropPrefixes(prefixes [][]byte) error {
 	return nil
 }
 
+// 压缩相关的内容, Badger 使用 levelsController 来维护.
 func (s *levelsController) startCompact(lc *z.Closer) {
 	n := s.kv.opt.NumCompactors
 	lc.AddRunning(n - 1)
@@ -375,6 +377,8 @@ type targets struct {
 // example, when L6 reaches 1.1GB, then L4 target sizes becomes 11MB, thus exceeding the
 // BaseLevelSize of 10MB. L3 would then become the new Lbase, with a target size of 1MB <
 // BaseLevelSize.
+//
+// 计算出目标的 Level Size.
 func (s *levelsController) levelTargets() targets {
 	adjust := func(sz int64) int64 {
 		if sz < s.kv.opt.BaseLevelSize {
@@ -432,10 +436,12 @@ func (s *levelsController) levelTargets() targets {
 	return t
 }
 
+// 长跑的多个 goroutine.
 func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 	defer lc.Done()
 
 	randomDelay := time.NewTimer(time.Duration(rand.Int31n(1000)) * time.Millisecond)
+	// 定期触发.
 	select {
 	case <-randomDelay.C:
 	case <-lc.HasBeenClosed():
@@ -443,6 +449,7 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 		return
 	}
 
+	// 把 compactionPriority 放到前面
 	moveL0toFront := func(prios []compactionPriority) []compactionPriority {
 		idx := -1
 		for i, p := range prios {
@@ -475,6 +482,7 @@ func (s *levelsController) runCompactor(id int, lc *z.Closer) {
 		return false
 	}
 	runOnce := func() bool {
+		// 挑选需要压缩的内容.
 		prios := s.pickCompactLevels()
 		if id == 0 {
 			// Worker ID zero prefers to compact L0 always.
@@ -550,9 +558,11 @@ func (s *levelsController) pickCompactLevels() (prios []compactionPriority) {
 	}
 
 	// Add L0 priority based on the number of tables.
+	// L0 score: L0Table / 应该有的.
 	addPriority(0, float64(s.levels[0].numTables())/float64(s.kv.opt.NumLevelZeroTables))
 
 	// All other levels use size to calculate priority.
+	// 其他层的: https://github.com/facebook/rocksdb/wiki/Leveled-Compaction
 	for i := 1; i < len(s.levels); i++ {
 		// Don't consider those tables that are already being compacted right now.
 		delSize := s.cstatus.delSize(i)
@@ -629,6 +639,8 @@ func (s *levelsController) checkOverlap(tables []*table.Table, lev int) bool {
 // split the main compaction up into sub-compactions. Each sub-compaction runs
 // concurrently, only iterating over the provided key range, generating tables.
 // This speeds up the compaction significantly.
+//
+// 这里分成不同的 KeyRange 来拆分成 subcompact.
 func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 	inflightBuilders *y.Throttle, res chan<- *table.Table) {
 
@@ -639,6 +651,8 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 	// Pick a discard ts, so we can discard versions below this ts. We should
 	// never discard any versions starting from above this timestamp, because
 	// that would affect the snapshot view guarantee provided by transactions.
+	//
+	// 关于 discard 版本的逻辑
 	discardTs := s.kv.orc.discardAtOrBelow()
 
 	// Try to collect stats so that we can inform value log about GC. That would help us find which
@@ -652,6 +666,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		if vs.Meta&bitValuePointer > 0 {
 			var vp valuePointer
 			vp.Decode(vs.Value)
+			// 如果是 value 有关的, compaction 之后,
 			discardStats[vp.Fid] += int64(vp.Len)
 		}
 	}
@@ -667,7 +682,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		n2nl := s.levels[n2n]
 		n2nl.RLock()
 		defer n2nl.RUnlock()
-
+		// 找到 key range 下层找到重叠的 tables.
 		l, r := n2nl.overlappingTables(levelHandlerRLocked{}, kr)
 		return r-l >= 10
 	}
@@ -684,16 +699,22 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		timeStart := time.Now()
 		var numKeys, numSkips uint64
 		var rangeCheck int
+		// adjust tableKr
 		var tableKr keyRange
+		// it 用的是外部的, 我不知道为什么...
+		// 可能是因为有病吧?
 		for ; it.Valid(); it.Next() {
 			// See if we need to skip the prefix.
+			// drop prefix 会 ignore 这些.
 			if len(cd.dropPrefixes) > 0 && hasAnyPrefixes(it.Key(), cd.dropPrefixes) {
 				numSkips++
+				// 设置 vLog 为无用的.
 				updateStats(it.Value())
 				continue
 			}
 
 			// See if we need to skip this key.
+			// skipKey
 			if len(skipKey) > 0 {
 				if y.SameKey(it.Key(), skipKey) {
 					numSkips++
@@ -738,13 +759,17 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 				}
 			}
 
+			// 拿到具体内容
 			vs := it.Value()
 			version := y.ParseTs(it.Key())
 
+			// 是否 ttl 了, ttl 了感觉就丢了.
 			isExpired := isDeletedOrExpired(vs.Meta, vs.ExpiresAt)
 
 			// Do not discard entries inserted by merge operator. These entries will be
 			// discarded once they're merged
+			//
+			// version <= discardTs, 这个数据如果不是最后一条应该是可以 drop 掉的.
 			if version <= discardTs && vs.Meta&bitMergeEntry == 0 {
 				// Keep track of the number of versions encountered for this key. Only consider the
 				// versions which are below the minReadTs, otherwise, we might end up discarding the
@@ -754,12 +779,17 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 				// - The `discardEarlierVersions` bit is set OR
 				// - We've already processed `NumVersionsToKeep` number of versions
 				// (including the current item being processed)
+				//
+				// DiscardEarlierVersions 是用户在 `Merge` 使用的时候，或者带 `WithDiscard()` 的时候,
+				// 才会出现的.
 				lastValidVersion := vs.Meta&BitDiscardEarlierVersions > 0 ||
 					numVersions == s.kv.opt.NumVersionsToKeep
 
 				if isExpired || lastValidVersion {
 					// If this version of the key is deleted or expired, skip all the rest of the
 					// versions. Ensure that we're only removing versions below readTs.
+					//
+					// 只要有 lastValidVersion, 都会标记上 skipKey
 					skipKey = y.SafeCopy(skipKey, it.Key())
 
 					switch {
@@ -768,12 +798,22 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 					case !isExpired && lastValidVersion:
 						// Add this key. We have set skipKey, so the following key versions
 						// would be skipped.
+						//
+						// 没有过期, 然后是 "最后一个合理版本", 所以需要保留
 					case hasOverlap:
 						// If this key range has overlap with lower levels, then keep the deletion
 						// marker with the latest version, discarding the rest. We have set skipKey,
 						// so the following key versions would be skipped.
+						//
+						// hasOverlap 是一个很全局的信息, 这一点比较糟糕. 这里会和 skipKey 联动.
+						// 这里比方说, 读到的 key 是一个 expired 了, 但是更下层有别的版本的 key, 那这个 key 还是要保留 expire
+						// 的信息的.
 					default:
 						// If no overlap, we can skip all the versions, by continuing here.
+						// 走到这里说明:
+						// 1. 没有 overlap
+						// 2. expire 了, 或者不是一个可以 keep 的版本.
+						// 以上两个条件都满足, 数据可以 discard 掉了.
 						numSkips++
 						updateStats(vs)
 						continue // Skip adding this key.
@@ -803,6 +843,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			cd.compactorId, numKeys, numSkips, time.Since(timeStart).Round(time.Millisecond))
 	} // End of function: addKeys
 
+	// reset iterator.
 	if len(kr.left) > 0 {
 		it.Seek(kr.left)
 	} else {
@@ -816,6 +857,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 		bopts := buildTableOptions(s.kv)
 		// Set TableSize to the target file size for that level.
 		bopts.TableSize = uint64(cd.t.fileSz[cd.nextLevel.level])
+		// 创建独立的 TableBuilder
 		builder := table.NewTableBuilder(bopts)
 
 		// This would do the iteration and add keys to builder.
@@ -834,6 +876,7 @@ func (s *levelsController) subcompact(it y.Iterator, kr keyRange, cd compactDef,
 			// Can't return from here, until I decrRef all the tables that I built so far.
 			break
 		}
+		// async build file.
 		go func(builder *table.Builder, fileID uint64) {
 			var err error
 			defer inflightBuilders.Done(err)
@@ -890,7 +933,7 @@ func (s *levelsController) compactBuildTables(
 			valid = append(valid, table)
 		}
 	}
-
+	// 构建 iter 的方法.
 	newIterator := func() []y.Iterator {
 		// Create iterators across all the tables involved first.
 		var iters []y.Iterator
@@ -906,6 +949,7 @@ func (s *levelsController) compactBuildTables(
 	}
 
 	res := make(chan *table.Table, 3)
+	// 正在执行的 builder goroutine 不能有很多.
 	inflightBuilders := y.NewThrottle(8 + len(cd.splits))
 	for _, kr := range cd.splits {
 		// Initiate Do here so we can register the goroutines for buildTables too.
@@ -915,6 +959,7 @@ func (s *levelsController) compactBuildTables(
 		}
 		go func(kr keyRange) {
 			defer inflightBuilders.Done(nil)
+			// 这里会构建很多不同的 Iterator, 但是查不同的 keyrange
 			it := table.NewMergeIterator(newIterator(), false)
 			defer it.Close()
 			s.subcompact(it, kr, cd, inflightBuilders, res)
@@ -950,6 +995,7 @@ func (s *levelsController) compactBuildTables(
 		return nil, nil, y.Wrapf(err, "while running compactions for: %+v", cd)
 	}
 
+	// 排序并返回.
 	sort.Slice(newTables, func(i, j int) bool {
 		return y.CompareKeys(newTables[i].Biggest(), newTables[j].Biggest()) < 0
 	})
@@ -1037,14 +1083,16 @@ type compactDef struct {
 	thisLevel   *levelHandler
 	nextLevel   *levelHandler
 
+	// top
 	top []*table.Table
+	// bottom
 	bot []*table.Table
 
 	thisRange keyRange
 	nextRange keyRange
 	splits    []keyRange
 
-	thisSize int64
+	thisSize int64	// 这一层的 sst size
 
 	dropPrefixes [][]byte
 }
@@ -1415,7 +1463,8 @@ func (s *levelsController) runCompactDef(id, l int, cd compactDef) (err error) {
 
 	// Table should never be moved directly between levels, always be rewritten to allow discarding
 	// invalid versions.
-
+	//
+	// 构建 table, 比较重要的部分.
 	newTables, decr, err := s.compactBuildTables(l, cd)
 	if err != nil {
 		return err
@@ -1480,6 +1529,8 @@ func tablesToString(tables []*table.Table) []string {
 var errFillTables = errors.New("Unable to fill tables")
 
 // doCompact picks some table on level l and compacts it away to the next level.
+//
+// 压缩外部调用的地方, 这里是个多线程的处理.
 func (s *levelsController) doCompact(id int, p compactionPriority) error {
 	l := p.level
 	y.AssertTrue(l < s.kv.opt.MaxLevels) // Sanity check.
@@ -1538,7 +1589,7 @@ func (s *levelsController) addLevel0Table(t *table.Table) error {
 		// the proper order. (That means this update happens before that of some compaction which
 		// deletes the table.)
 		err := s.kv.manifest.addChanges([]*pb.ManifestChange{
-			newCreateChange(t.ID(), 0, t.KeyID(), t.CompressionType()),
+			newCreateChange(t.ID(), /* level */ 0, t.KeyID(), t.CompressionType()),
 		})
 		if err != nil {
 			return err
@@ -1548,6 +1599,7 @@ func (s *levelsController) addLevel0Table(t *table.Table) error {
 	for !s.levels[0].tryAddLevel0Table(t) {
 		// Before we unstall, we need to make sure that level 0 is healthy.
 		timeStart := time.Now()
+		// 这里有 stall 啊, 发现 Level0 超过之后睡 10ms.
 		for s.levels[0].numTables() >= s.kv.opt.NumLevelZeroTablesStall {
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -1579,6 +1631,8 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 	// read level L's tables post-compaction and level L+1's tables pre-compaction. (If we do
 	// parallelize this, we will need to call the h.RLock() function by increasing order of level
 	// number.)
+	//
+	// 需要从高度到低, 因为这个 get 没有拿到一把大锁, 合并可能漏过需要的.( 话说我感觉这个地方是不是会死锁, 然后从上到下做死锁避免).
 	version := y.ParseTs(key)
 	for _, h := range s.levels {
 		// Ignore all levels below startLevel. This is useful for GC when L0 is kept in memory.
@@ -1592,6 +1646,7 @@ func (s *levelsController) get(key []byte, maxVs y.ValueStruct, startLevel int) 
 		if vs.Value == nil && vs.Meta == 0 {
 			continue
 		}
+		// 要么读到匹配的 ts, 要么读到最接近的版本.
 		if vs.Version == version {
 			return vs, nil
 		}
