@@ -2021,6 +2021,8 @@ func (db *DB) DropPrefixNonBlocking(prefixes ...[]byte) error {
 // DropPrefix would drop all the keys with the provided prefix. Based on DB options, it either drops
 // the prefixes by blocking the writes or doing a logical drop.
 // See DropPrefixBlocking and DropPrefixNonBlocking for more information.
+//
+// 删除掉所有有 prefixes 的逻辑
 func (db *DB) DropPrefix(prefixes ...[]byte) error {
 	if db.opt.AllowStopTheWorld {
 		return db.DropPrefixBlocking(prefixes...)

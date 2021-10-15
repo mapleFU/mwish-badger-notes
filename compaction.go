@@ -27,6 +27,7 @@ import (
 	"github.com/dgraph-io/badger/v3/y"
 )
 
+// 这个 range 就是一个很朴素的 range, 没有考虑开闭区间
 type keyRange struct {
 	left  []byte
 	right []byte

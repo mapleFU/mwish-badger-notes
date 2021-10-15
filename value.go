@@ -173,6 +173,8 @@ func (r *safeRead) Entry(reader io.Reader) (*Entry, error) {
 	return e, nil
 }
 
+// gc 的流程. 这里会用 `vlog.db.batchSet` 回写db.
+// 这不会再单独写 vLog 文件.
 func (vlog *valueLog) rewrite(f *logFile) error {
 	vlog.filesLock.RLock()
 	for _, fid := range vlog.filesToBeDeleted {
@@ -1081,6 +1083,7 @@ LOOP:
 }
 
 func discardEntry(e Entry, vs y.ValueStruct, db *DB) bool {
+	// 这个 version 没了(存在的话会很准的拿到).
 	if vs.Version != y.ParseTs(e.Key) {
 		// Version not found. Discard.
 		return true

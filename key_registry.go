@@ -44,6 +44,7 @@ const (
 var sanityText = []byte("Hello Badger")
 
 // KeyRegistry used to maintain all the data keys.
+// 和加密有关，存储在专门文件中。
 type KeyRegistry struct {
 	sync.RWMutex
 	dataKeys    map[uint64]*pb.DataKey

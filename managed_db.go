@@ -16,6 +16,8 @@
 
 package badger
 
+// Managed mode 的接口, 暂时不想读.
+//
 // OpenManaged returns a new DB, which allows more control over setting
 // transaction timestamps, aka managed mode.
 //

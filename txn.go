@@ -133,6 +133,7 @@ func (o *oracle) setDiscardTs(ts uint64) {
 	o.cleanupCommittedTransactions()
 }
 
+// 返回读的低水位, 小于这个的数据可以被 GC(discard) 掉.
 func (o *oracle) discardAtOrBelow() uint64 {
 	if o.isManaged {
 		o.Lock()

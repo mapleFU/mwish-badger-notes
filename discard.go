@@ -30,8 +30,11 @@ import (
 // discardStats keeps track of the amount of data that could be discarded for
 // a given logfile.
 //
-// discard 也是 vLog 相关的单独文件, 内容存在 mmap 文件中. 每个 slot 长度是 16bytes 的 <fid: I64, discard: U64>, mmap 的很大.
+// discard 也是 vLog 相关的单独文件, 内容存在 mmap 文件中. 每个 slot 长度是 16bytes 的 <fid: I64, discard: U64>, 按照 fid 有序存储.
+// 维护 nextEmptySlot 作为内存中的 next 水位, 用 mmap 文件的长度来初始化.
 // Compaction LSM 和 VLog 应该是互相影响的, vlog compaction 要写入一堆前台(所以读也要从上往下).
+//
+// 这里会选出最应该 gc 的 vLog 文件.
 type discardStats struct {
 	sync.Mutex
 
